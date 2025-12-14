@@ -763,54 +763,69 @@ def find_flow_gradients(colors: list, directional: dict, coverage: dict,
     scored_colors.sort(key=lambda x: x[1], reverse=True)
 
     all_gradients = []
-    used = set()
 
     # Single unified loop - try top colors by combined score
+    # Colors can appear in multiple gradients (no 'used' set)
     for direction in ['right', 'left', 'below', 'above',
                       'down_right', 'down_left', 'up_right', 'up_left']:
         for start, start_score in scored_colors[:40]:  # Try more candidates
-            if start in used:
-                continue
-
             chain = follow_flow(start, direction)
 
             if len(chain) >= min_chain_length:
                 chain_cov = sum(coverage.get(b, 0) for b in chain)
 
-                # Compute LAB range
+                # Compute LAB bounds for transition comparison
                 labs = [bin_to_lab(b, scale) for b in chain]
                 lab_array = np.array(labs)
-                l_range = lab_array[:, 0].max() - lab_array[:, 0].min()
-                a_range = lab_array[:, 1].max() - lab_array[:, 1].min()
-                b_range = lab_array[:, 2].max() - lab_array[:, 2].min()
+                l_min, l_max = lab_array[:, 0].min(), lab_array[:, 0].max()
+                a_min, a_max = lab_array[:, 1].min(), lab_array[:, 1].max()
+                b_min, b_max = lab_array[:, 2].min(), lab_array[:, 2].max()
 
                 all_gradients.append({
                     'chain': chain,
                     'direction': direction,
                     'coverage': chain_cov,
-                    'l_range': l_range,
-                    'a_range': a_range,
-                    'b_range': b_range,
+                    'l_range': l_max - l_min,
+                    'a_range': a_max - a_min,
+                    'b_range': b_max - b_min,
+                    'l_bounds': (l_min, l_max),
+                    'a_bounds': (a_min, a_max),
+                    'b_bounds': (b_min, b_max),
                     'score': len(chain) * chain_cov,
-                    'starting_score': start_score  # Track for debugging
+                    'starting_score': start_score
                 })
-
-                used.update(chain)
 
     # Sort by score (coverage-based gradients will rank higher)
     all_gradients.sort(key=lambda x: x['score'], reverse=True)
 
-    # Deduplicate
+    def bounds_overlap(bounds1, bounds2):
+        """Compute overlap ratio: how much of bounds1 is inside bounds2."""
+        min1, max1 = bounds1
+        min2, max2 = bounds2
+        range1 = max1 - min1
+        if range1 < 0.1:  # Avoid division by tiny ranges
+            return 1.0 if min2 <= min1 <= max2 else 0.0
+        overlap_min = max(min1, min2)
+        overlap_max = min(max1, max2)
+        overlap = max(0, overlap_max - overlap_min)
+        return overlap / range1
+
+    # Deduplicate by LAB transition: drop gradients whose LAB range
+    # is mostly contained within an existing gradient's range
     final_gradients = []
     for grad in all_gradients:
-        chain_set = set(grad['chain'])
-        is_dup = False
+        is_redundant = False
         for existing in final_gradients:
-            overlap = len(chain_set & set(existing['chain']))
-            if overlap > 0.5 * len(chain_set):
-                is_dup = True
+            # Check if this gradient's LAB bounds are mostly inside existing's
+            l_overlap = bounds_overlap(grad['l_bounds'], existing['l_bounds'])
+            a_overlap = bounds_overlap(grad['a_bounds'], existing['a_bounds'])
+            b_overlap = bounds_overlap(grad['b_bounds'], existing['b_bounds'])
+
+            # If all three dimensions are ≥50% contained, it's redundant
+            if l_overlap >= 0.5 and a_overlap >= 0.5 and b_overlap >= 0.5:
+                is_redundant = True
                 break
-        if not is_dup:
+        if not is_redundant:
             final_gradients.append(grad)
 
     return final_gradients
