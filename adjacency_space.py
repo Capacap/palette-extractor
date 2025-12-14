@@ -16,7 +16,7 @@ from pathlib import Path
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from scipy.signal import find_peaks
-from scipy.ndimage import gaussian_filter1d, uniform_filter
+from scipy.ndimage import gaussian_filter1d, uniform_filter, label
 
 from extract_colors import rgb_to_lab, lab_to_rgb, JND
 
@@ -400,6 +400,116 @@ def analyze_salience(colors: list, adjacency: dict, coverage: dict,
     return results
 
 
+def compute_spatial_coherence(binned: np.ndarray, colors: list,
+                               coverage: dict) -> dict:
+    """
+    Compute spatial coherence for each color.
+
+    Coherence measures how clustered vs scattered a color's pixels are.
+    High coherence = pixels form one or few large blobs (signal)
+    Low coherence = pixels scattered across many small blobs (noise/dither)
+
+    Returns dict with per-color metrics:
+    - coherence: largest_blob_pixels / total_pixels (0-1)
+    - blob_count: number of connected components
+    - largest_blob: pixel count of largest connected component
+    """
+    h, w = binned.shape[:2]
+    results = {}
+
+    for b in colors:
+        # Create binary mask for this color
+        mask = np.all(binned == b, axis=2)
+        total = coverage.get(b, 0)
+
+        if total == 0:
+            results[b] = {
+                'coherence': 0.0,
+                'blob_count': 0,
+                'largest_blob': 0
+            }
+            continue
+
+        # Find connected components (4-connectivity)
+        labeled, num_blobs = label(mask)
+
+        if num_blobs == 0:
+            results[b] = {
+                'coherence': 0.0,
+                'blob_count': 0,
+                'largest_blob': 0
+            }
+            continue
+
+        # Count pixels in each blob
+        blob_sizes = np.bincount(labeled.ravel())[1:]  # Skip background (0)
+        largest_blob = int(np.max(blob_sizes))
+
+        results[b] = {
+            'coherence': largest_blob / total,
+            'blob_count': num_blobs,
+            'largest_blob': largest_blob
+        }
+
+    return results
+
+
+def identify_noise_colors(coherence: dict, coverage: dict,
+                          threshold: float = 0.3) -> set:
+    """
+    Identify colors likely to be noise based on relative coherence.
+
+    Uses median coherence as baseline - a color is noise if:
+    - coherence < threshold * median_coherence
+
+    This adapts to image characteristics:
+    - Smooth photo: high median coherence, strict filter
+    - Pollock painting: low median coherence, permissive filter
+
+    Args:
+        coherence: dict from compute_spatial_coherence
+        coverage: dict of bin -> pixel count (for weighting)
+        threshold: fraction of median below which a color is noise
+
+    Returns:
+        set of bin tuples identified as noise
+    """
+    if not coherence:
+        return set()
+
+    # Compute coverage-weighted median coherence
+    # Weight by coverage so dominant colors influence the baseline more
+    total_coverage = sum(coverage.values())
+    weighted_coherences = []
+    weights = []
+
+    for b, stats in coherence.items():
+        coh = stats['coherence']
+        cov = coverage.get(b, 0) / total_coverage
+        weighted_coherences.append(coh)
+        weights.append(cov)
+
+    # Sort by coherence to find weighted median
+    sorted_pairs = sorted(zip(weighted_coherences, weights))
+    cumsum = 0
+    median_coherence = sorted_pairs[-1][0]  # fallback to max
+    for coh, w in sorted_pairs:
+        cumsum += w
+        if cumsum >= 0.5:
+            median_coherence = coh
+            break
+
+    # Identify noise: coherence significantly below median
+    noise_threshold = threshold * median_coherence
+    noise = set()
+
+    for b, stats in coherence.items():
+        if stats['coherence'] < noise_threshold:
+            noise.add(b)
+
+    return noise, median_coherence
+
+
 def analyze_gradient_flow(directional: dict, colors: list, coverage: dict,
                           scale: float = 3.0, min_flow: int = 50) -> dict:
     """
@@ -472,31 +582,47 @@ def find_flow_gradients(colors: list, directional: dict, coverage: dict,
 
     # Build directed graph based on flow
     # Edge from A to B if B is predominantly in one direction from A
+    # Weight edges by coherence: noisy transitions are less meaningful
     flow_graph = {b: {'right': [], 'left': [], 'below': [], 'above': []} for b in colors}
+
+    def get_coherence(b):
+        """Get coherence for a color, defaulting to 1.0 if not available."""
+        if salience and b in salience:
+            return salience[b].get('coherence', 1.0)
+        return 1.0
 
     for (b1, b2), analysis in flow.items():
         if b1 not in flow_graph or b2 not in flow_graph:
             continue
 
+        # Weight by geometric mean of coherences
+        # Transitions between coherent colors are more meaningful
+        coh1, coh2 = get_coherence(b1), get_coherence(b2)
+        coherence_weight = np.sqrt(coh1 * coh2)
+
         # Check horizontal flow
         if analysis['h_asymmetry'] > min_asymmetry:
             if analysis['h_flow'] > 0:
                 # b2 is predominantly RIGHT of b1
-                flow_graph[b1]['right'].append((b2, analysis['h_flow'], analysis['total']))
+                weighted_flow = analysis['h_flow'] * coherence_weight
+                flow_graph[b1]['right'].append((b2, weighted_flow, analysis['total']))
             else:
                 # b2 is predominantly LEFT of b1
-                flow_graph[b1]['left'].append((b2, -analysis['h_flow'], analysis['total']))
+                weighted_flow = -analysis['h_flow'] * coherence_weight
+                flow_graph[b1]['left'].append((b2, weighted_flow, analysis['total']))
 
         # Check vertical flow
         if analysis['v_asymmetry'] > min_asymmetry:
             if analysis['v_flow'] > 0:
                 # b2 is predominantly BELOW b1
-                flow_graph[b1]['below'].append((b2, analysis['v_flow'], analysis['total']))
+                weighted_flow = analysis['v_flow'] * coherence_weight
+                flow_graph[b1]['below'].append((b2, weighted_flow, analysis['total']))
             else:
                 # b2 is predominantly ABOVE b1
-                flow_graph[b1]['above'].append((b2, -analysis['v_flow'], analysis['total']))
+                weighted_flow = -analysis['v_flow'] * coherence_weight
+                flow_graph[b1]['above'].append((b2, weighted_flow, analysis['total']))
 
-    # Sort neighbors by flow strength
+    # Sort neighbors by coherence-weighted flow strength
     for b in flow_graph:
         for direction in flow_graph[b]:
             flow_graph[b][direction].sort(key=lambda x: x[1], reverse=True)
@@ -1757,6 +1883,27 @@ if __name__ == '__main__':
     for b in colors:
         salience[b]['multihop_contrast'] = multihop.get(b, 0)
 
+    # Compute spatial coherence BEFORE gradient detection
+    # (coherence is used to weight flow edges)
+    print("Computing spatial coherence...")
+    coherence = compute_spatial_coherence(binned, colors, coverage)
+
+    # Add coherence to salience dict
+    for b in colors:
+        coh = coherence.get(b, {'coherence': 0, 'blob_count': 0, 'largest_blob': 0})
+        salience[b]['coherence'] = coh['coherence']
+        salience[b]['blob_count'] = coh['blob_count']
+        salience[b]['largest_blob'] = coh['largest_blob']
+
+    # Identify noise colors based on relative coherence
+    noise_colors, median_coherence = identify_noise_colors(coherence, coverage, threshold=0.3)
+    print(f"Median coherence: {median_coherence:.2f}, noise threshold: {0.3 * median_coherence:.2f}")
+    print(f"Identified {len(noise_colors)} noise colors ({len(noise_colors)/len(colors)*100:.1f}%)")
+
+    # Mark noise in salience dict
+    for b in colors:
+        salience[b]['is_noise'] = b in noise_colors
+
     # Find flow-based gradients with unified scoring (coverage + salience)
     print("\n--- Directional Flow Method (unified scoring) ---")
     flow_gradients = find_flow_gradients(
@@ -1796,6 +1943,8 @@ if __name__ == '__main__':
     multihop_contrasts = [s['multihop_contrast'] for s in salience.values()]
     global_contrasts = [s['global_contrast'] for s in salience.values()]
     chromas = [s['chroma'] for s in salience.values()]
+    coherences = [s['coherence'] for s in salience.values()]
+    blob_counts = [s['blob_count'] for s in salience.values()]
 
     print(f"Coverage:        min={min(coverages):.4f}, max={max(coverages):.4f}, mean={np.mean(coverages):.4f}")
     print(f"Local contrast (1-hop adj):  min={min(local_contrasts):.1f}, max={max(local_contrasts):.1f}, mean={np.mean(local_contrasts):.1f}")
@@ -1803,6 +1952,8 @@ if __name__ == '__main__':
     print(f"Multi-hop contrast (3-hop):  min={min(multihop_contrasts):.1f}, max={max(multihop_contrasts):.1f}, mean={np.mean(multihop_contrasts):.1f}")
     print(f"Global contrast: min={min(global_contrasts):.2f}, max={max(global_contrasts):.2f}, mean={np.mean(global_contrasts):.2f}")
     print(f"Chroma:          min={min(chromas):.1f}, max={max(chromas):.1f}, mean={np.mean(chromas):.1f}")
+    print(f"Coherence:       min={min(coherences):.2f}, max={max(coherences):.2f}, mean={np.mean(coherences):.2f}")
+    print(f"Blob count:      min={min(blob_counts)}, max={max(blob_counts)}, mean={np.mean(blob_counts):.1f}")
 
     # Find colors that are salient by different metrics
     print("\n--- Top Colors by Coverage ---")
@@ -1851,6 +2002,23 @@ if __name__ == '__main__':
     for b, s in by_multihop:
         print(f"  L={s['lab'][0]:5.1f} a={s['lab'][1]:5.1f} b={s['lab'][2]:5.1f}  "
               f"cov={s['coverage']:.4f} 1hop={s['local_contrast']:.1f} 3hop={s['multihop_contrast']:.1f} global={s['global_contrast']:.2f}")
+
+    print("\n--- Top Colors by Coherence (most spatially coherent) ---")
+    by_coherence = sorted(salience.items(), key=lambda x: x[1]['coherence'], reverse=True)[:8]
+    for b, s in by_coherence:
+        print(f"  L={s['lab'][0]:5.1f} a={s['lab'][1]:5.1f} b={s['lab'][2]:5.1f}  "
+              f"cov={s['coverage']:.4f} coherence={s['coherence']:.2f} blobs={s['blob_count']}")
+
+    print("\n--- Noise Colors (relative coherence filter) ---")
+    noise_list = [(b, s) for b, s in salience.items() if s['is_noise']]
+    noise_list.sort(key=lambda x: x[1]['coherence'])
+    for b, s in noise_list[:8]:
+        print(f"  L={s['lab'][0]:5.1f} a={s['lab'][1]:5.1f} b={s['lab'][2]:5.1f}  "
+              f"cov={s['coverage']:.4f} coherence={s['coherence']:.2f} blobs={s['blob_count']}")
+    if not noise_list:
+        print("  (none identified as noise)")
+    elif len(noise_list) > 8:
+        print(f"  ... and {len(noise_list) - 8} more")
 
     # Visualize salient colors
     visualize_salience(salience, str(output_dir / f"{test_image.stem}_salience.png"),
