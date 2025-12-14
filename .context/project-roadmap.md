@@ -1,72 +1,67 @@
 # Current Focus
 
-## Status: Directional Flow Gradients
+## Status: Unified Gradient Detection with Significance
 
-Enriched adjacency with directional information. The `find_flow_gradients()` method now captures **hue gradients** (not just lightness) by tracking spatial flow direction.
+Integrated significance metrics into gradient detection. Starting points are now selected by unified score combining coverage and significance, allowing dark/contrasting colors to emerge naturally.
 
 ## What We Built
 
-### Directional Adjacency (New)
-For each color pair, track not just "they're adjacent" but "in which direction":
+### Significance Metrics
+- **Multi-hop contrast**: LAB distance to colors reachable within 3 hops in adjacency graph
+- **Global contrast**: Inverse density in LAB space (rare colors score high)
+- **Local contrast**: Average LAB distance to spatial neighbors
+
+### Unified Starting Score
+Instead of separate phases for coverage-based and significance-based gradients:
+```python
+score = coverage * 10 + significance * 0.15
+```
+- Coverage remains primary (high-coverage colors rank first)
+- Significance provides secondary boost for dark/contrasting colors
+- Dark accent colors emerge naturally without separate phase
+
+### Directional Flow Detection
+For each color pair, track spatial direction:
 - `(blue, pink)['right']` = count of times pink is RIGHT of blue
-- `(blue, pink)['left']` = count of times pink is LEFT of blue
-- Same for `above`/`below`
-
-**Asymmetry reveals gradient flow**: If `right >> left`, the gradient flows left-to-right.
-
-### Flow Gradient Detection
-1. Build directional adjacency from image
-2. Compute flow asymmetry for each color pair
-3. Build directed graph: edge A→B if B is predominantly in one direction from A
-4. Follow flow chains to extract gradients
-5. Report gradient direction (right/left/above/below) and LAB ranges
+- Asymmetry reveals gradient flow direction
 
 ### Results on soft_gradients.jpeg
-- **Main gradient** (31.2%, 29 colors): warm→cool face lighting, `a=34, b=76` range
-- **Dark gradients** captured: blues at L=14, L=21 (horns, shadows)
-- Found gradients in multiple directions (above, below, right, left)
-- Hue transitions now detected, not just lightness
-
-### Key Parameters
-- `min_chain_length=3` (captures short dark region gradients)
-- `min_asymmetry=0.25` (detects weaker directional flow)
+- **Main gradient** (31.2%, 29 colors): warm→cool face lighting
+- **Dark gradients captured naturally**: L=13.8, L=20.7 starting points
+- No separate "accent" phase needed
 
 ## Methods Comparison
 
-| Method | Finds L gradients | Finds hue gradients | Spatial structure |
-|--------|-------------------|---------------------|-------------------|
-| PC-following | Yes | Weak | None |
-| Graph-based (LAB monotonic) | Yes | No | Adjacency only |
-| **Directional flow** | Yes | **Yes** | **Direction-aware** |
+| Method | L gradients | Hue gradients | Dark accents | Spatial |
+|--------|-------------|---------------|--------------|---------|
+| PC-following | Yes | Weak | No | None |
+| Graph-based (LAB monotonic) | Yes | No | Yes (merged) | Adjacency |
+| **Directional flow + significance** | Yes | **Yes** | **Yes (emergent)** | **Direction-aware** |
 
 ## Files
 
 - `extract_colors.py` - Palette extraction (stable)
 - `extract_gradients.py` - Region-based approach (archived)
-- `adjacency_space.py` - **Current focus** - multiple gradient detection methods
+- `adjacency_space.py` - **Current focus** - unified gradient detection
+
+## Key Functions
+
+- `compute_multihop_contrast()` - 3-hop contrast metric
+- `compute_global_contrast()` - LAB space density inverse
+- `find_flow_gradients()` - Unified scoring, directional flow following
 
 ## Next Steps to Explore
-
-### Contrast-Based Significance Weighting
-**Key insight**: Colors that contrast from their surroundings are visually significant even with small coverage. The dark horns/eyelashes stand out precisely because they contrast strongly.
-
-Ideas:
-- **Local contrast score**: For each color, measure average LAB distance to its neighbors
-- **Significance = coverage × contrast**: Small but high-contrast features get boosted
-- **Edge detection proxy**: High-contrast colors often define object boundaries
-- Could use this to weight gradient importance or ensure contrasting colors are included
-
-### Further Enrichment
-- **Diagonal directions**: Add 4 diagonal adjacency directions for more precision
-- **Multi-scale flow**: Track flow at different neighborhood sizes
-- **Combine flow with LAB constraints**: Follow flow AND require smooth LAB progression
 
 ### Gradient Merging
 - Some gradients may be fragments of the same visual gradient
 - Merge chains that share endpoints and have compatible directions/colors
 
+### Further Enrichment
+- **Diagonal directions**: Add 4 diagonal adjacency directions
+- **Multi-scale flow**: Track flow at different neighborhood sizes
+
 ## Notes
 
-**Breakthrough**: Directional adjacency captures gradient flow that pure adjacency misses. A warm-to-cool lighting gradient appears as consistent upward flow (warm below, cool above).
+**Key insight**: Both high coverage and high contrast make a color important. The unified score lets them compete fairly for gradient seeds.
 
-**Remaining gap**: Very dark/high-contrast features need explicit handling. Current method finds them with relaxed parameters, but a significance weighting approach could make this more principled.
+**Breakthrough**: Dark accent colors (eyelashes, horns) now emerge naturally through the same mechanism that finds main gradients - no bolt-on required.
