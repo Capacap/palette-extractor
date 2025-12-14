@@ -16,7 +16,7 @@ from pathlib import Path
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from scipy.signal import find_peaks
-from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import gaussian_filter1d, uniform_filter
 
 from extract_colors import rgb_to_lab, lab_to_rgb, JND
 
@@ -129,6 +129,277 @@ def build_directional_adjacency(binned: np.ndarray) -> dict:
     return directional
 
 
+def compute_local_contrast(colors: list, adjacency: dict, scale: float = 3.0) -> dict:
+    """
+    Compute local contrast for each color - average LAB distance to spatial neighbors.
+
+    High local contrast = color stands out from its immediate surroundings in the image.
+    This captures boundary/edge colors.
+
+    Returns:
+        dict mapping bin -> local_contrast score
+    """
+    # Build neighbor lookup with LAB distances
+    neighbor_distances = {b: [] for b in colors}
+
+    for (b1, b2), count in adjacency.items():
+        if b1 not in neighbor_distances or b2 not in neighbor_distances:
+            continue
+
+        lab1 = bin_to_lab(b1, scale)
+        lab2 = bin_to_lab(b2, scale)
+        dist = np.linalg.norm(lab1 - lab2)
+
+        # Weight by adjacency count (more contact = more relevant)
+        neighbor_distances[b1].extend([dist] * min(count, 100))
+        neighbor_distances[b2].extend([dist] * min(count, 100))
+
+    # Compute mean distance for each color
+    local_contrast = {}
+    for b in colors:
+        if neighbor_distances[b]:
+            local_contrast[b] = np.mean(neighbor_distances[b])
+        else:
+            local_contrast[b] = 0.0
+
+    return local_contrast
+
+
+def compute_multihop_contrast(colors: list, adjacency: dict, coverage: dict,
+                               scale: float = 3.0, max_hops: int = 3) -> dict:
+    """
+    Compute contrast considering multi-hop neighbors in the adjacency graph.
+
+    For each color, finds neighbors up to max_hops away and computes
+    the maximum LAB distance to any reachable color, weighted by coverage.
+
+    This captures that dark eyelashes are "near" skin tones even if they
+    transition through intermediate colors.
+
+    Args:
+        colors: list of bin tuples
+        adjacency: dict of (bin1, bin2) -> count
+        coverage: dict of bin -> pixel count
+        scale: JND scale for bin_to_lab
+        max_hops: how many steps to look in adjacency graph
+
+    Returns:
+        dict mapping bin -> max contrast to reachable high-coverage colors
+    """
+    # Build neighbor lookup
+    neighbors = {b: set() for b in colors}
+    for (b1, b2), count in adjacency.items():
+        if b1 in neighbors and b2 in neighbors:
+            neighbors[b1].add(b2)
+            neighbors[b2].add(b1)
+
+    # Get LAB values
+    lab_values = {b: bin_to_lab(b, scale) for b in colors}
+
+    # For weighting by coverage
+    total_pixels = sum(coverage.values())
+    cov_weight = {b: coverage.get(b, 0) / total_pixels for b in colors}
+
+    def get_reachable(start, hops):
+        """Get all colors reachable within n hops, with their hop distance."""
+        reachable = {start: 0}
+        frontier = {start}
+
+        for hop in range(1, hops + 1):
+            new_frontier = set()
+            for node in frontier:
+                for neighbor in neighbors.get(node, []):
+                    if neighbor not in reachable:
+                        reachable[neighbor] = hop
+                        new_frontier.add(neighbor)
+            frontier = new_frontier
+
+        return reachable
+
+    multihop_contrast = {}
+
+    for b in colors:
+        reachable = get_reachable(b, max_hops)
+        lab_b = lab_values[b]
+
+        # Find max contrast to high-coverage reachable colors
+        max_contrast = 0
+        weighted_sum = 0
+        weight_total = 0
+
+        for other, hops in reachable.items():
+            if other == b:
+                continue
+
+            lab_other = lab_values[other]
+            dist = np.linalg.norm(lab_b - lab_other)
+
+            # Weight: prefer closer hops and higher coverage
+            hop_weight = 1.0 / (hops + 0.5)  # 1-hop=0.67, 2-hop=0.4, 3-hop=0.29
+            weight = hop_weight * (cov_weight[other] + 0.001)  # small baseline
+
+            weighted_sum += dist * weight
+            weight_total += weight
+
+            # Track max contrast (unweighted)
+            if dist > max_contrast:
+                max_contrast = dist
+
+        # Return coverage-weighted mean contrast to reachable colors
+        if weight_total > 0:
+            multihop_contrast[b] = weighted_sum / weight_total
+        else:
+            multihop_contrast[b] = 0.0
+
+    return multihop_contrast
+
+
+def compute_pixel_local_contrast(lab_image: np.ndarray, binned: np.ndarray,
+                                  colors: list, radius: int = 5) -> dict:
+    """
+    Compute local contrast at the pixel level using convolution.
+
+    For each pixel, measures LAB distance to the local mean in a neighborhood.
+    Then aggregates by color bin.
+
+    Args:
+        lab_image: (H, W, 3) LAB image
+        binned: (H, W, 3) quantized bin indices
+        colors: list of bin tuples to compute contrast for
+        radius: neighborhood radius for local mean (box filter size = 2*radius+1)
+
+    Returns:
+        dict mapping bin -> mean local contrast for pixels of that color
+    """
+    h, w = lab_image.shape[:2]
+    size = 2 * radius + 1
+
+    # Compute local mean for each LAB channel using box filter
+    local_mean = np.zeros_like(lab_image, dtype=np.float32)
+    for c in range(3):
+        local_mean[:, :, c] = uniform_filter(lab_image[:, :, c].astype(np.float32), size=size)
+
+    # Compute per-pixel contrast (LAB distance to local mean)
+    diff = lab_image.astype(np.float32) - local_mean
+    pixel_contrast = np.sqrt(np.sum(diff ** 2, axis=2))
+
+    # Aggregate by color bin
+    color_to_contrasts = {b: [] for b in colors}
+
+    # Create bin lookup for fast matching
+    bin_tuples = np.zeros((h, w), dtype=object)
+    for y in range(h):
+        for x in range(w):
+            bin_tuples[y, x] = tuple(binned[y, x])
+
+    # This is slow - let's use a faster approach
+    # Build a mapping from bin tuple to mask
+    contrast_sums = {}
+    contrast_counts = {}
+
+    for b in colors:
+        # Create mask for this bin
+        mask = (binned[:, :, 0] == b[0]) & (binned[:, :, 1] == b[1]) & (binned[:, :, 2] == b[2])
+        if mask.sum() > 0:
+            contrast_sums[b] = pixel_contrast[mask].sum()
+            contrast_counts[b] = mask.sum()
+        else:
+            contrast_sums[b] = 0
+            contrast_counts[b] = 0
+
+    # Compute mean contrast per bin
+    local_contrast = {}
+    for b in colors:
+        if contrast_counts.get(b, 0) > 0:
+            local_contrast[b] = contrast_sums[b] / contrast_counts[b]
+        else:
+            local_contrast[b] = 0.0
+
+    return local_contrast
+
+
+def compute_global_contrast(colors: list, coverage: dict, scale: float = 3.0,
+                            radius: float = 20.0) -> dict:
+    """
+    Compute global contrast for each color - inverse of nearby coverage in LAB space.
+
+    High global contrast = color is rare/isolated in the overall palette.
+    A gray in a mostly-red image has high global contrast.
+
+    Args:
+        colors: list of bin tuples
+        coverage: dict of bin -> pixel count
+        scale: JND scale for bin_to_lab
+        radius: LAB distance within which to sum coverage
+
+    Returns:
+        dict mapping bin -> global_contrast score (0-1, higher = more isolated)
+    """
+    total_pixels = sum(coverage.values())
+
+    # Get LAB values for all colors
+    lab_values = {b: bin_to_lab(b, scale) for b in colors}
+
+    # For each color, compute coverage within radius
+    nearby_coverage = {}
+
+    for b in colors:
+        lab_b = lab_values[b]
+        nearby = 0
+
+        for other, lab_other in lab_values.items():
+            dist = np.linalg.norm(lab_b - lab_other)
+            if dist <= radius:
+                # Weight by proximity (closer = counts more)
+                weight = 1.0 - (dist / radius)
+                nearby += coverage.get(other, 0) * weight
+
+        nearby_coverage[b] = nearby / total_pixels
+
+    # Convert to contrast: inverse of density, normalized
+    max_density = max(nearby_coverage.values()) if nearby_coverage else 1.0
+
+    global_contrast = {}
+    for b in colors:
+        # Invert: low density -> high contrast
+        density = nearby_coverage[b] / (max_density + 1e-10)
+        global_contrast[b] = 1.0 - density
+
+    return global_contrast
+
+
+def analyze_significance(colors: list, adjacency: dict, coverage: dict,
+                         scale: float = 3.0) -> dict:
+    """
+    Analyze color significance using multiple metrics.
+
+    Returns dict with per-color metrics:
+    - coverage: fraction of image
+    - local_contrast: stands out from spatial neighbors
+    - global_contrast: stands out from overall palette
+    - chroma: saturation level
+    """
+    total_pixels = sum(coverage.values())
+
+    local = compute_local_contrast(colors, adjacency, scale)
+    global_c = compute_global_contrast(colors, coverage, scale)
+
+    results = {}
+    for b in colors:
+        lab = bin_to_lab(b, scale)
+        chroma = np.sqrt(lab[1]**2 + lab[2]**2)
+
+        results[b] = {
+            'coverage': coverage.get(b, 0) / total_pixels,
+            'local_contrast': local.get(b, 0),
+            'global_contrast': global_c.get(b, 0),
+            'chroma': chroma,
+            'lab': lab
+        }
+
+    return results
+
+
 def analyze_gradient_flow(directional: dict, colors: list, coverage: dict,
                           scale: float = 3.0, min_flow: int = 50) -> dict:
     """
@@ -171,13 +442,29 @@ def analyze_gradient_flow(directional: dict, colors: list, coverage: dict,
 
 def find_flow_gradients(colors: list, directional: dict, coverage: dict,
                         scale: float = 3.0, min_chain_length: int = 5,
-                        min_asymmetry: float = 0.3) -> list[dict]:
+                        min_asymmetry: float = 0.3,
+                        significance: dict = None,
+                        min_significance_chain: int = 2) -> list[dict]:
     """
     Find gradients by following directional flow through the adjacency graph.
 
     A gradient is a chain where colors consistently flow in one direction:
     - Horizontal gradient: each color has the next color predominantly to its right (or left)
     - Vertical gradient: each color has the next color predominantly below (or above)
+
+    If significance dict is provided, also seeds gradients from high-significance
+    colors (high multi-hop contrast or global contrast), allowing shorter chains.
+    This captures accent color gradients that would otherwise be missed.
+
+    Args:
+        colors: list of bin tuples
+        directional: directional adjacency dict
+        coverage: dict of bin -> pixel count
+        scale: JND scale for bin_to_lab
+        min_chain_length: minimum chain length for coverage-seeded gradients
+        min_asymmetry: minimum flow asymmetry to follow an edge
+        significance: optional dict with per-color significance metrics
+        min_significance_chain: minimum chain length for significance-seeded gradients
 
     Returns list of gradient dicts with chain, direction, and metadata.
     """
@@ -274,7 +561,66 @@ def find_flow_gradients(colors: list, directional: dict, coverage: dict,
 
                 used.update(chain)
 
-    # Sort by score
+    # Phase 2: Seed gradients from significant colors (if significance provided)
+    # This captures accent colors that have low coverage but high visual importance
+    if significance:
+        # Find significant colors not yet in any gradient
+        sig_threshold_multihop = 15.0  # Lower than accent extraction was using
+        sig_threshold_global = 0.7
+
+        significant_starts = []
+        for b in colors:
+            if b in used:
+                continue
+            stats = significance.get(b, {})
+            multihop = stats.get('multihop_contrast', 0)
+            global_c = stats.get('global_contrast', 0)
+
+            if multihop >= sig_threshold_multihop or global_c >= sig_threshold_global:
+                # Score by combined significance
+                score = multihop + global_c * 30
+                significant_starts.append((b, score, multihop, global_c))
+
+        # Sort by significance score
+        significant_starts.sort(key=lambda x: x[1], reverse=True)
+
+        # Try each significant color as a starting point
+        for start, score, multihop, global_c in significant_starts[:20]:
+            if start in used:
+                continue
+
+            # Try all directions
+            for direction in ['right', 'left', 'below', 'above']:
+                chain = follow_flow(start, direction)
+
+                # Use lower threshold for significance-seeded chains
+                if len(chain) >= min_significance_chain:
+                    chain_cov = sum(coverage.get(b, 0) for b in chain)
+
+                    # Compute LAB range
+                    labs = [bin_to_lab(b, scale) for b in chain]
+                    lab_array = np.array(labs)
+                    l_range = lab_array[:, 0].max() - lab_array[:, 0].min()
+                    a_range = lab_array[:, 1].max() - lab_array[:, 1].min()
+                    b_range = lab_array[:, 2].max() - lab_array[:, 2].min()
+
+                    all_gradients.append({
+                        'chain': chain,
+                        'direction': direction,
+                        'coverage': chain_cov,
+                        'l_range': l_range,
+                        'a_range': a_range,
+                        'b_range': b_range,
+                        'score': len(chain) * chain_cov,
+                        'type': 'accent',  # Mark as significance-seeded
+                        'multihop_contrast': multihop,
+                        'global_contrast': global_c
+                    })
+
+                    used.update(chain)
+                    break  # Found a gradient for this color, move on
+
+    # Sort by score (coverage-based gradients will rank higher)
     all_gradients.sort(key=lambda x: x['score'], reverse=True)
 
     # Deduplicate
@@ -1119,14 +1465,212 @@ def find_gradient_paths(embedding: np.ndarray, colors: list, adjacency: dict,
     return chains
 
 
+def extract_accent_colors(gradients: list[dict], significance: dict,
+                           min_multihop: float = 20.0, min_global: float = 0.8,
+                           max_accents: int = 8) -> list[dict]:
+    """
+    Extract significant colors that aren't captured by the gradients.
+
+    These are "accent colors" - visually important due to contrast but too
+    isolated or small to form gradient chains.
+
+    Args:
+        gradients: list of gradient dicts with 'chain' key
+        significance: dict from analyze_significance with multihop_contrast
+        min_multihop: minimum multi-hop contrast to be considered significant
+        min_global: minimum global contrast to be considered significant
+        max_accents: maximum accent colors to return
+
+    Returns:
+        list of accent color dicts with bin, lab, and significance metrics
+    """
+    # Collect all colors already in gradients
+    gradient_colors = set()
+    for grad in gradients:
+        gradient_colors.update(grad['chain'])
+
+    # Find significant colors not in gradients
+    accents = []
+    for bin_tuple, stats in significance.items():
+        if bin_tuple in gradient_colors:
+            continue
+
+        # Check if significant by either metric
+        is_significant = (
+            stats.get('multihop_contrast', 0) >= min_multihop or
+            stats.get('global_contrast', 0) >= min_global
+        )
+
+        if is_significant:
+            accents.append({
+                'bin': bin_tuple,
+                'lab': stats['lab'],
+                'coverage': stats['coverage'],
+                'multihop_contrast': stats.get('multihop_contrast', 0),
+                'global_contrast': stats['global_contrast'],
+                'chroma': stats['chroma']
+            })
+
+    # Sort by combined significance (multi-hop weighted more since it captures local importance)
+    accents.sort(key=lambda x: x['multihop_contrast'] * 2 + x['global_contrast'] * 20, reverse=True)
+
+    return accents[:max_accents]
+
+
+def visualize_significance(significance: dict, output_path: str, scale: float = 3.0,
+                            top_n: int = 10):
+    """
+    Visualize significant colors as swatches, organized by metric.
+
+    Creates a grid showing top colors by:
+    - Coverage (dominant colors)
+    - Multi-hop contrast (colors that contrast with nearby high-coverage colors)
+    - Global contrast (rare/isolated colors)
+    """
+    from PIL import ImageDraw, ImageFont
+
+    swatch_size = 40
+    padding = 8
+    label_width = 180
+    row_height = swatch_size + padding
+
+    # Get top colors by each metric
+    by_coverage = sorted(significance.items(), key=lambda x: x[1]['coverage'], reverse=True)[:top_n]
+    by_multihop = sorted(significance.items(), key=lambda x: x[1]['multihop_contrast'], reverse=True)[:top_n]
+    by_global = sorted(significance.items(), key=lambda x: x[1]['global_contrast'], reverse=True)[:top_n]
+
+    sections = [
+        ("Top by Coverage", by_coverage),
+        ("Top by Multi-Hop Contrast", by_multihop),
+        ("Top by Global Contrast (Rare)", by_global),
+    ]
+
+    # Calculate image size
+    img_width = label_width + top_n * swatch_size + padding * 2
+    img_height = len(sections) * (row_height + 25) + padding * 2 + 20
+
+    img = Image.new('RGB', (img_width, img_height), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    y = padding
+
+    for section_name, colors in sections:
+        # Section header
+        draw.text((padding, y), section_name, fill=(0, 0, 0))
+        y += 20
+
+        # Draw swatches
+        for i, (bin_tuple, stats) in enumerate(colors):
+            x = label_width + i * swatch_size
+
+            # Get RGB color
+            lab = bin_to_lab(bin_tuple, scale)
+            rgb = tuple(lab_to_rgb(lab.reshape(1, -1))[0])
+
+            # Draw swatch
+            draw.rectangle([x, y, x + swatch_size - 2, y + swatch_size - 2], fill=rgb)
+
+            # Draw border for visibility
+            draw.rectangle([x, y, x + swatch_size - 2, y + swatch_size - 2], outline=(128, 128, 128))
+
+        # Add stats for first few
+        stats_text = f"cov: {colors[0][1]['coverage']:.1%} → {colors[-1][1]['coverage']:.1%}"
+        draw.text((padding, y + swatch_size // 2 - 5), stats_text, fill=(100, 100, 100))
+
+        y += row_height + 5
+
+    img.save(output_path)
+    print(f"Saved significance swatches to {output_path}")
+
+
+def visualize_gradients_and_accents(gradients: list[dict], accents: list[dict],
+                                     coverage: dict, total_pixels: int,
+                                     output_path: str, scale: float = 3.0,
+                                     max_gradients: int = 5):
+    """
+    Visualize gradients and accent colors together as a complete palette.
+    """
+    from PIL import ImageDraw
+
+    swatch_size = 30
+    padding = 10
+    text_width = 140
+
+    # Limit gradients shown
+    gradients = gradients[:max_gradients]
+
+    # Calculate dimensions
+    max_grad_len = max((len(g['chain']) for g in gradients), default=1)
+    grad_width = text_width + max_grad_len * swatch_size + padding
+
+    accent_width = text_width + len(accents) * swatch_size + padding if accents else 0
+
+    img_width = max(grad_width, accent_width) + padding * 2
+    img_height = (len(gradients) + 2) * (swatch_size + padding) + padding * 2
+
+    img = Image.new('RGB', (img_width, img_height), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    y = padding
+
+    # Title
+    draw.text((padding, y), "Gradients:", fill=(0, 0, 0))
+    y += 20
+
+    # Draw gradients
+    for grad in gradients:
+        chain = grad['chain']
+        chain_cov = sum(coverage.get(b, 0) for b in chain) / total_pixels * 100
+
+        # Label
+        label = f"{grad['direction']} {chain_cov:.1f}%"
+        draw.text((padding, y + swatch_size // 2 - 5), label, fill=(80, 80, 80))
+
+        # Swatches
+        for i, bin_tuple in enumerate(chain):
+            x = text_width + i * swatch_size
+            lab = bin_to_lab(bin_tuple, scale)
+            rgb = tuple(lab_to_rgb(lab.reshape(1, -1))[0])
+            draw.rectangle([x, y, x + swatch_size - 2, y + swatch_size - 2], fill=rgb)
+
+        y += swatch_size + padding // 2
+
+    # Accent colors section
+    if accents:
+        y += padding
+        draw.text((padding, y), "Accents:", fill=(0, 0, 0))
+        y += 20
+
+        for i, acc in enumerate(accents):
+            x = text_width + i * swatch_size
+            rgb = tuple(lab_to_rgb(acc['lab'].reshape(1, -1))[0])
+            draw.rectangle([x, y, x + swatch_size - 2, y + swatch_size - 2], fill=rgb)
+            draw.rectangle([x, y, x + swatch_size - 2, y + swatch_size - 2], outline=(100, 100, 100))
+
+    img.save(output_path)
+    print(f"Saved palette (gradients + accents) to {output_path}")
+
+
 def visualize_chains(chains: list[list[tuple]], coverage: dict, total_pixels: int,
-                     output_path: str, scale: float = 3.0, max_chains: int = 10):
-    """Visualize gradient chains as color strips."""
+                     output_path: str, scale: float = 3.0, max_chains: int = 10,
+                     gradients: list[dict] = None):
+    """
+    Visualize gradient chains as color strips.
+
+    Args:
+        chains: list of chain lists (for backward compatibility)
+        coverage: dict of bin -> pixel count
+        total_pixels: total image pixels
+        output_path: where to save
+        scale: JND scale
+        max_chains: max to show
+        gradients: optional list of gradient dicts (if provided, uses metadata like 'type')
+    """
     from PIL import ImageDraw
 
     swatch_size = 25
     padding = 10
-    text_width = 120
+    text_width = 140  # Wider for accent labels
     row_height = swatch_size + padding
 
     chains = chains[:max_chains]
@@ -1142,14 +1686,33 @@ def visualize_chains(chains: list[list[tuple]], coverage: dict, total_pixels: in
         y = padding + row * row_height
 
         chain_cov = sum(coverage.get(b, 0) for b in chain) / total_pixels * 100
-        label = f"{chain_cov:.1f}% ({len(chain)} colors)"
-        draw.text((padding, y + swatch_size // 2 - 5), label, fill=(0, 0, 0))
+
+        # Check if this is an accent gradient
+        is_accent = False
+        direction = ""
+        if gradients and row < len(gradients):
+            is_accent = gradients[row].get('type') == 'accent'
+            direction = gradients[row].get('direction', '')
+
+        if is_accent:
+            label = f"[A] {chain_cov:.1f}% ({len(chain)})"
+            label_color = (100, 60, 120)  # Purple for accent
+        else:
+            label = f"{direction} {chain_cov:.1f}% ({len(chain)})"
+            label_color = (0, 0, 0)
+
+        draw.text((padding, y + swatch_size // 2 - 5), label, fill=label_color)
 
         for i, bin_tuple in enumerate(chain):
             x = text_width + i * swatch_size
             lab = bin_to_lab(bin_tuple, scale)
             rgb = lab_to_rgb(lab.reshape(1, -1))[0]
             draw.rectangle([x, y, x + swatch_size, y + swatch_size], fill=tuple(rgb))
+
+            # Add subtle border for accent gradients
+            if is_accent:
+                draw.rectangle([x, y, x + swatch_size, y + swatch_size],
+                             outline=(100, 60, 120))
 
     img.save(output_path)
     print(f"Saved {len(chains)} chains to {output_path}")
@@ -1217,25 +1780,143 @@ if __name__ == '__main__':
                      str(output_dir / f"{test_image.stem}_graph_gradients.png"),
                      max_chains=10)
 
-    # Build directional adjacency and find flow-based gradients
-    print("\n--- Directional Flow Method ---")
+    # Build directional adjacency
+    print("\n--- Building Directional Adjacency ---")
     directional = build_directional_adjacency(binned)
     print(f"Directional pairs: {len(directional)}")
 
+    # Compute significance metrics FIRST (needed for flow gradient seeding)
+    print("\n--- Computing Significance Metrics ---")
+    significance = analyze_significance(colors, adjacency, coverage, scale=3.0)
+
+    # Compute multi-hop adjacency contrast (key for accent color detection)
+    print("Computing multi-hop adjacency contrast...")
+    multihop = compute_multihop_contrast(colors, adjacency, coverage, scale=3.0, max_hops=3)
+
+    # Add multi-hop to significance dict
+    for b in colors:
+        significance[b]['multihop_contrast'] = multihop.get(b, 0)
+
+    # Now find flow-based gradients, seeded from BOTH coverage AND significance
+    print("\n--- Directional Flow Method (with significance seeding) ---")
     flow_gradients = find_flow_gradients(
         colors, directional, coverage,
-        scale=3.0, min_chain_length=3, min_asymmetry=0.25
+        scale=3.0, min_chain_length=3, min_asymmetry=0.25,
+        significance=significance, min_significance_chain=2
     )
-    print(f"Found {len(flow_gradients)} flow gradients")
+
+    # Count regular vs accent gradients
+    regular_grads = [g for g in flow_gradients if g.get('type') != 'accent']
+    accent_grads = [g for g in flow_gradients if g.get('type') == 'accent']
+    print(f"Found {len(flow_gradients)} flow gradients ({len(regular_grads)} from coverage, {len(accent_grads)} from significance)")
 
     for i, grad in enumerate(flow_gradients[:10]):
         chain = grad['chain']
         chain_cov = sum(coverage.get(b, 0) for b in chain) / total_pixels * 100
+        grad_type = " [accent]" if grad.get('type') == 'accent' else ""
         print(f"  {grad['direction']:>5} gradient: {len(chain):2d} colors, {chain_cov:5.1f}%, "
-              f"L={grad['l_range']:.0f} a={grad['a_range']:.0f} b={grad['b_range']:.0f}")
+              f"L={grad['l_range']:.0f} a={grad['a_range']:.0f} b={grad['b_range']:.0f}{grad_type}")
 
-    # Visualize flow gradients
+    # Visualize flow gradients (with accent markers)
     flow_chains = [g['chain'] for g in flow_gradients]
     visualize_chains(flow_chains, coverage, total_pixels,
                      str(output_dir / f"{test_image.stem}_flow_gradients.png"),
-                     max_chains=10)
+                     max_chains=12, gradients=flow_gradients)
+
+    # Compute pixel-level local contrast (for analysis)
+    print("\n--- Significance Analysis ---")
+    print("Computing pixel-level local contrast...")
+    pixel_contrast = compute_pixel_local_contrast(lab, binned, colors, radius=5)
+
+    # Add pixel contrast to significance dict
+    for b in colors:
+        significance[b]['pixel_contrast'] = pixel_contrast.get(b, 0)
+
+    # Show distribution of metrics
+    coverages = [s['coverage'] for s in significance.values()]
+    local_contrasts = [s['local_contrast'] for s in significance.values()]
+    pixel_contrasts = [s['pixel_contrast'] for s in significance.values()]
+    multihop_contrasts = [s['multihop_contrast'] for s in significance.values()]
+    global_contrasts = [s['global_contrast'] for s in significance.values()]
+    chromas = [s['chroma'] for s in significance.values()]
+
+    print(f"Coverage:        min={min(coverages):.4f}, max={max(coverages):.4f}, mean={np.mean(coverages):.4f}")
+    print(f"Local contrast (1-hop adj):  min={min(local_contrasts):.1f}, max={max(local_contrasts):.1f}, mean={np.mean(local_contrasts):.1f}")
+    print(f"Local contrast (pixel):      min={min(pixel_contrasts):.1f}, max={max(pixel_contrasts):.1f}, mean={np.mean(pixel_contrasts):.1f}")
+    print(f"Multi-hop contrast (3-hop):  min={min(multihop_contrasts):.1f}, max={max(multihop_contrasts):.1f}, mean={np.mean(multihop_contrasts):.1f}")
+    print(f"Global contrast: min={min(global_contrasts):.2f}, max={max(global_contrasts):.2f}, mean={np.mean(global_contrasts):.2f}")
+    print(f"Chroma:          min={min(chromas):.1f}, max={max(chromas):.1f}, mean={np.mean(chromas):.1f}")
+
+    # Find colors that are significant by different metrics
+    print("\n--- Top Colors by Coverage ---")
+    by_coverage = sorted(significance.items(), key=lambda x: x[1]['coverage'], reverse=True)[:5]
+    for b, s in by_coverage:
+        print(f"  L={s['lab'][0]:5.1f} a={s['lab'][1]:5.1f} b={s['lab'][2]:5.1f}  "
+              f"cov={s['coverage']:.3f} local={s['local_contrast']:.1f} global={s['global_contrast']:.2f}")
+
+    print("\n--- Top Colors by Local Contrast ---")
+    by_local = sorted(significance.items(), key=lambda x: x[1]['local_contrast'], reverse=True)[:5]
+    for b, s in by_local:
+        print(f"  L={s['lab'][0]:5.1f} a={s['lab'][1]:5.1f} b={s['lab'][2]:5.1f}  "
+              f"cov={s['coverage']:.3f} local={s['local_contrast']:.1f} global={s['global_contrast']:.2f}")
+
+    print("\n--- Top Colors by Global Contrast (Rare in Palette) ---")
+    by_global = sorted(significance.items(), key=lambda x: x[1]['global_contrast'], reverse=True)[:5]
+    for b, s in by_global:
+        print(f"  L={s['lab'][0]:5.1f} a={s['lab'][1]:5.1f} b={s['lab'][2]:5.1f}  "
+              f"cov={s['coverage']:.3f} local={s['local_contrast']:.1f} global={s['global_contrast']:.2f}")
+
+    print("\n--- High Local Contrast but Low Coverage (edge/boundary colors) ---")
+    # Normalize for comparison
+    max_local = max(local_contrasts)
+    max_cov = max(coverages)
+    edge_colors = [
+        (b, s) for b, s in significance.items()
+        if s['local_contrast'] / max_local > 0.5 and s['coverage'] / max_cov < 0.1
+    ]
+    edge_colors.sort(key=lambda x: x[1]['local_contrast'], reverse=True)
+    for b, s in edge_colors[:5]:
+        print(f"  L={s['lab'][0]:5.1f} a={s['lab'][1]:5.1f} b={s['lab'][2]:5.1f}  "
+              f"cov={s['coverage']:.4f} local={s['local_contrast']:.1f} global={s['global_contrast']:.2f}")
+
+    print("\n--- Darkest Colors (L < 25) ---")
+    dark_colors = [(b, s) for b, s in significance.items() if s['lab'][0] < 25]
+    dark_colors.sort(key=lambda x: x[1]['lab'][0])
+    if dark_colors:
+        for b, s in dark_colors[:8]:
+            print(f"  L={s['lab'][0]:5.1f} a={s['lab'][1]:5.1f} b={s['lab'][2]:5.1f}  "
+                  f"cov={s['coverage']:.4f} 1hop={s['local_contrast']:.1f} 3hop={s['multihop_contrast']:.1f} global={s['global_contrast']:.2f}")
+    else:
+        print("  (none found - may be filtered by min_coverage)")
+
+    print("\n--- Top Colors by Multi-Hop Contrast ---")
+    by_multihop = sorted(significance.items(), key=lambda x: x[1]['multihop_contrast'], reverse=True)[:8]
+    for b, s in by_multihop:
+        print(f"  L={s['lab'][0]:5.1f} a={s['lab'][1]:5.1f} b={s['lab'][2]:5.1f}  "
+              f"cov={s['coverage']:.4f} 1hop={s['local_contrast']:.1f} 3hop={s['multihop_contrast']:.1f} global={s['global_contrast']:.2f}")
+
+    # Visualize significant colors
+    visualize_significance(significance, str(output_dir / f"{test_image.stem}_significance.png"),
+                           scale=3.0, top_n=12)
+
+    # Show accent gradients summary
+    print("\n--- Accent Gradients (from significance seeding) ---")
+    accent_grads = [g for g in flow_gradients if g.get('type') == 'accent']
+    if accent_grads:
+        for grad in accent_grads:
+            chain = grad['chain']
+            chain_cov = sum(coverage.get(b, 0) for b in chain) / total_pixels * 100
+            # Get LAB of first color in chain
+            first_lab = bin_to_lab(chain[0], 3.0)
+            print(f"  {grad['direction']:>5}: {len(chain)} colors, {chain_cov:.2f}%, "
+                  f"starts at L={first_lab[0]:.1f} a={first_lab[1]:.1f} b={first_lab[2]:.1f}")
+    else:
+        print("  (none found - all significant colors already in coverage-based gradients)")
+
+    # Check raw coverage for very dark bins
+    print("\n--- Dark Bins in Raw Data (before filtering) ---")
+    dark_bins = [(b, c) for b, c in coverage.items() if bin_to_lab(b, 3.0)[0] < 25]
+    dark_bins.sort(key=lambda x: bin_to_lab(x[0], 3.0)[0])
+    for b, c in dark_bins[:8]:
+        lab = bin_to_lab(b, 3.0)
+        print(f"  L={lab[0]:5.1f} a={lab[1]:5.1f} b={lab[2]:5.1f}  pixels={c:6d} ({c/total_pixels*100:.3f}%)")

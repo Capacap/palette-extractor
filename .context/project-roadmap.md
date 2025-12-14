@@ -1,59 +1,72 @@
 # Current Focus
 
-## Status: Experimental - Gradient Detection
+## Status: Directional Flow Gradients
 
-Single-file implementation with 3-stage palette pipeline (working):
-1. JND perceptual quantization (2.3 LAB units)
-2. Chromaticity-based family grouping (ignores lightness)
-3. Adaptive shade extraction (shadow/midtone/highlight for large families)
+Enriched adjacency with directional information. The `find_flow_gradients()` method now captures **hue gradients** (not just lightness) by tracking spatial flow direction.
 
-Separate `extract_gradients.py` for gradient experiments (cleaner separation).
+## What We Built
 
-## Gradient Detection: Current Approach
+### Directional Adjacency (New)
+For each color pair, track not just "they're adjacent" but "in which direction":
+- `(blue, pink)['right']` = count of times pink is RIGHT of blue
+- `(blue, pink)['left']` = count of times pink is LEFT of blue
+- Same for `above`/`below`
 
-Using 3x JND + adjacency distance cutoff + drift checking:
+**Asymmetry reveals gradient flow**: If `right >> left`, the gradient flows left-to-right.
 
-1. **Quantize at 3x JND** - 417 colors (manageable, good connectivity)
-2. **Build adjacency with distance cutoff** - only count neighbors within 8 LAB as adjacent (filters hard edges)
-3. **Chain building with drift check** - new colors must be within 25 LAB of last 3 chain members (breaks chains when they wander too far in color space)
-4. **Greedy extension** - start from highest-coverage colors, extend in both directions
+### Flow Gradient Detection
+1. Build directional adjacency from image
+2. Compute flow asymmetry for each color pair
+3. Build directed graph: edge A→B if B is predominantly in one direction from A
+4. Follow flow chains to extract gradients
+5. Report gradient direction (right/left/above/below) and LAB ranges
 
-### Results
-- 38 chains found (vs 1 giant chain without drift check)
-- Main chain: 118 colors, 86.4% coverage
-- Separate dark chain: 31 colors, 8.1% coverage
-- Gradients follow adjacency order (smoother than L-sorted)
+### Results on soft_gradients.jpeg
+- **Main gradient** (31.2%, 29 colors): warm→cool face lighting, `a=34, b=76` range
+- **Dark gradients** captured: blues at L=14, L=21 (horns, shadows)
+- Found gradients in multiple directions (above, below, right, left)
+- Hue transitions now detected, not just lightness
 
-### What works
-- Distance cutoff filters hard edges between unrelated colors
-- Drift check breaks chains when color changes direction
-- Following adjacency order produces smoother gradients than sorting by L
+### Key Parameters
+- `min_chain_length=3` (captures short dark region gradients)
+- `min_asymmetry=0.25` (detects weaker directional flow)
 
-### What needs work
-- Gradients still not perfectly smooth
-- Large chains absorb too many colors
-- Need better way to identify distinct gradient regions
+## Methods Comparison
 
-## Next Steps
-
-**Region-based approach**: Identify spatial regions in the image first, then find gradients within each region. This would:
-- Separate the blue background from the warm foreground
-- Allow each region to have its own gradient
-- Prevent chains from jumping between unrelated areas
-
-Possible approaches:
-- Use connected components of similar colors
-- Spatial clustering (not just color clustering)
-- Watershed or other segmentation algorithms
+| Method | Finds L gradients | Finds hue gradients | Spatial structure |
+|--------|-------------------|---------------------|-------------------|
+| PC-following | Yes | Weak | None |
+| Graph-based (LAB monotonic) | Yes | No | Adjacency only |
+| **Directional flow** | Yes | **Yes** | **Direction-aware** |
 
 ## Files
 
-- `extract_colors.py` - Palette extraction (stable, working)
-- `extract_gradients.py` - Gradient experiments (in progress)
+- `extract_colors.py` - Palette extraction (stable)
+- `extract_gradients.py` - Region-based approach (archived)
+- `adjacency_space.py` - **Current focus** - multiple gradient detection methods
 
-## Other Improvements
+## Next Steps to Explore
 
-- Color naming (map LAB to human-readable names)
-- JSON/CSS output for design tools
-- CLI arguments for thresholds
-- Handle more image formats (PNG, WebP)
+### Contrast-Based Significance Weighting
+**Key insight**: Colors that contrast from their surroundings are visually significant even with small coverage. The dark horns/eyelashes stand out precisely because they contrast strongly.
+
+Ideas:
+- **Local contrast score**: For each color, measure average LAB distance to its neighbors
+- **Significance = coverage × contrast**: Small but high-contrast features get boosted
+- **Edge detection proxy**: High-contrast colors often define object boundaries
+- Could use this to weight gradient importance or ensure contrasting colors are included
+
+### Further Enrichment
+- **Diagonal directions**: Add 4 diagonal adjacency directions for more precision
+- **Multi-scale flow**: Track flow at different neighborhood sizes
+- **Combine flow with LAB constraints**: Follow flow AND require smooth LAB progression
+
+### Gradient Merging
+- Some gradients may be fragments of the same visual gradient
+- Merge chains that share endpoints and have compatible directions/colors
+
+## Notes
+
+**Breakthrough**: Directional adjacency captures gradient flow that pure adjacency misses. A warm-to-cool lighting gradient appears as consistent upward flow (warm below, cool above).
+
+**Remaining gap**: Very dark/high-contrast features need explicit handling. Current method finds them with relaxed parameters, but a significance weighting approach could make this more principled.
