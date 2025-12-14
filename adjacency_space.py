@@ -441,10 +441,9 @@ def analyze_gradient_flow(directional: dict, colors: list, coverage: dict,
 
 
 def find_flow_gradients(colors: list, directional: dict, coverage: dict,
-                        scale: float = 3.0, min_chain_length: int = 5,
+                        scale: float = 3.0, min_chain_length: int = 3,
                         min_asymmetry: float = 0.3,
-                        significance: dict = None,
-                        min_significance_chain: int = 2) -> list[dict]:
+                        significance: dict = None) -> list[dict]:
     """
     Find gradients by following directional flow through the adjacency graph.
 
@@ -452,19 +451,19 @@ def find_flow_gradients(colors: list, directional: dict, coverage: dict,
     - Horizontal gradient: each color has the next color predominantly to its right (or left)
     - Vertical gradient: each color has the next color predominantly below (or above)
 
-    If significance dict is provided, also seeds gradients from high-significance
-    colors (high multi-hop contrast or global contrast), allowing shorter chains.
-    This captures accent color gradients that would otherwise be missed.
+    Starting points are selected by unified score: coverage + significance.
+    Both high-coverage colors and high-contrast colors compete for gradient seeds.
+    This naturally captures accent colors without a separate phase.
 
     Args:
         colors: list of bin tuples
         directional: directional adjacency dict
         coverage: dict of bin -> pixel count
         scale: JND scale for bin_to_lab
-        min_chain_length: minimum chain length for coverage-seeded gradients
+        min_chain_length: minimum chain length for valid gradients
         min_asymmetry: minimum flow asymmetry to follow an edge
         significance: optional dict with per-color significance metrics
-        min_significance_chain: minimum chain length for significance-seeded gradients
+            (if None, falls back to coverage-only ranking)
 
     Returns list of gradient dicts with chain, direction, and metadata.
     """
@@ -526,14 +525,46 @@ def find_flow_gradients(colors: list, directional: dict, coverage: dict,
 
         return chain
 
-    # Find gradients starting from high-coverage colors
-    sorted_colors = sorted(colors, key=lambda b: coverage.get(b, 0), reverse=True)
+    # Compute unified starting score: coverage + significance
+    # Both high coverage and high contrast make a color important as gradient seed
+    total_pixels = sum(coverage.values())
+
+    def compute_starting_score(b):
+        """Unified score combining coverage and significance."""
+        # Normalize coverage to 0-1
+        cov_normalized = coverage.get(b, 0) / total_pixels
+
+        # Get significance metrics (if available)
+        if significance and b in significance:
+            stats = significance[b]
+            # Normalize multihop contrast (typically 10-25 range) to ~0-1
+            multihop = stats.get('multihop_contrast', 0) / 25.0
+            # Global contrast already 0-1
+            global_c = stats.get('global_contrast', 0)
+            # Combined significance: weight multihop more (it captures local contrast)
+            sig_normalized = multihop * 0.7 + global_c * 0.3
+        else:
+            sig_normalized = 0
+
+        # Unified score: coverage is primary, significance is secondary boost
+        # Scale coverage to be competitive (max ~1.1 for 11% coverage)
+        # Significance adds a smaller boost (max ~0.15) so it can nudge rankings
+        # but not completely override coverage
+        cov_scaled = cov_normalized * 10  # 11% -> 1.1, 0.5% -> 0.05
+        sig_boost = sig_normalized * 0.15  # max 0.15 boost
+
+        return cov_scaled + sig_boost
+
+    # Sort all colors by unified starting score
+    scored_colors = [(b, compute_starting_score(b)) for b in colors]
+    scored_colors.sort(key=lambda x: x[1], reverse=True)
 
     all_gradients = []
     used = set()
 
+    # Single unified loop - try top colors by combined score
     for direction in ['right', 'left', 'below', 'above']:
-        for start in sorted_colors[:30]:
+        for start, start_score in scored_colors[:40]:  # Try more candidates
             if start in used:
                 continue
 
@@ -556,69 +587,11 @@ def find_flow_gradients(colors: list, directional: dict, coverage: dict,
                     'l_range': l_range,
                     'a_range': a_range,
                     'b_range': b_range,
-                    'score': len(chain) * chain_cov
+                    'score': len(chain) * chain_cov,
+                    'starting_score': start_score  # Track for debugging
                 })
 
                 used.update(chain)
-
-    # Phase 2: Seed gradients from significant colors (if significance provided)
-    # This captures accent colors that have low coverage but high visual importance
-    if significance:
-        # Find significant colors not yet in any gradient
-        sig_threshold_multihop = 15.0  # Lower than accent extraction was using
-        sig_threshold_global = 0.7
-
-        significant_starts = []
-        for b in colors:
-            if b in used:
-                continue
-            stats = significance.get(b, {})
-            multihop = stats.get('multihop_contrast', 0)
-            global_c = stats.get('global_contrast', 0)
-
-            if multihop >= sig_threshold_multihop or global_c >= sig_threshold_global:
-                # Score by combined significance
-                score = multihop + global_c * 30
-                significant_starts.append((b, score, multihop, global_c))
-
-        # Sort by significance score
-        significant_starts.sort(key=lambda x: x[1], reverse=True)
-
-        # Try each significant color as a starting point
-        for start, score, multihop, global_c in significant_starts[:20]:
-            if start in used:
-                continue
-
-            # Try all directions
-            for direction in ['right', 'left', 'below', 'above']:
-                chain = follow_flow(start, direction)
-
-                # Use lower threshold for significance-seeded chains
-                if len(chain) >= min_significance_chain:
-                    chain_cov = sum(coverage.get(b, 0) for b in chain)
-
-                    # Compute LAB range
-                    labs = [bin_to_lab(b, scale) for b in chain]
-                    lab_array = np.array(labs)
-                    l_range = lab_array[:, 0].max() - lab_array[:, 0].min()
-                    a_range = lab_array[:, 1].max() - lab_array[:, 1].min()
-                    b_range = lab_array[:, 2].max() - lab_array[:, 2].min()
-
-                    all_gradients.append({
-                        'chain': chain,
-                        'direction': direction,
-                        'coverage': chain_cov,
-                        'l_range': l_range,
-                        'a_range': a_range,
-                        'b_range': b_range,
-                        'score': len(chain) * chain_cov,
-                        'type': 'accent',  # Mark as significance-seeded
-                        'multihop_contrast': multihop,
-                        'global_contrast': global_c
-                    })
-
-                    used.update(chain)
-                    break  # Found a gradient for this color, move on
 
     # Sort by score (coverage-based gradients will rank higher)
     all_gradients.sort(key=lambda x: x['score'], reverse=True)
@@ -1664,13 +1637,13 @@ def visualize_chains(chains: list[list[tuple]], coverage: dict, total_pixels: in
         output_path: where to save
         scale: JND scale
         max_chains: max to show
-        gradients: optional list of gradient dicts (if provided, uses metadata like 'type')
+        gradients: optional list of gradient dicts (if provided, uses metadata like direction)
     """
     from PIL import ImageDraw
 
     swatch_size = 25
     padding = 10
-    text_width = 140  # Wider for accent labels
+    text_width = 120
     row_height = swatch_size + padding
 
     chains = chains[:max_chains]
@@ -1687,32 +1660,19 @@ def visualize_chains(chains: list[list[tuple]], coverage: dict, total_pixels: in
 
         chain_cov = sum(coverage.get(b, 0) for b in chain) / total_pixels * 100
 
-        # Check if this is an accent gradient
-        is_accent = False
+        # Get direction from gradient metadata if available
         direction = ""
         if gradients and row < len(gradients):
-            is_accent = gradients[row].get('type') == 'accent'
             direction = gradients[row].get('direction', '')
 
-        if is_accent:
-            label = f"[A] {chain_cov:.1f}% ({len(chain)})"
-            label_color = (100, 60, 120)  # Purple for accent
-        else:
-            label = f"{direction} {chain_cov:.1f}% ({len(chain)})"
-            label_color = (0, 0, 0)
-
-        draw.text((padding, y + swatch_size // 2 - 5), label, fill=label_color)
+        label = f"{direction} {chain_cov:.1f}% ({len(chain)})"
+        draw.text((padding, y + swatch_size // 2 - 5), label, fill=(0, 0, 0))
 
         for i, bin_tuple in enumerate(chain):
             x = text_width + i * swatch_size
             lab = bin_to_lab(bin_tuple, scale)
             rgb = lab_to_rgb(lab.reshape(1, -1))[0]
             draw.rectangle([x, y, x + swatch_size, y + swatch_size], fill=tuple(rgb))
-
-            # Add subtle border for accent gradients
-            if is_accent:
-                draw.rectangle([x, y, x + swatch_size, y + swatch_size],
-                             outline=(100, 60, 120))
 
     img.save(output_path)
     print(f"Saved {len(chains)} chains to {output_path}")
@@ -1797,27 +1757,24 @@ if __name__ == '__main__':
     for b in colors:
         significance[b]['multihop_contrast'] = multihop.get(b, 0)
 
-    # Now find flow-based gradients, seeded from BOTH coverage AND significance
-    print("\n--- Directional Flow Method (with significance seeding) ---")
+    # Find flow-based gradients with unified scoring (coverage + significance)
+    print("\n--- Directional Flow Method (unified scoring) ---")
     flow_gradients = find_flow_gradients(
         colors, directional, coverage,
         scale=3.0, min_chain_length=3, min_asymmetry=0.25,
-        significance=significance, min_significance_chain=2
+        significance=significance
     )
+    print(f"Found {len(flow_gradients)} flow gradients")
 
-    # Count regular vs accent gradients
-    regular_grads = [g for g in flow_gradients if g.get('type') != 'accent']
-    accent_grads = [g for g in flow_gradients if g.get('type') == 'accent']
-    print(f"Found {len(flow_gradients)} flow gradients ({len(regular_grads)} from coverage, {len(accent_grads)} from significance)")
-
-    for i, grad in enumerate(flow_gradients[:10]):
+    for i, grad in enumerate(flow_gradients[:12]):
         chain = grad['chain']
         chain_cov = sum(coverage.get(b, 0) for b in chain) / total_pixels * 100
-        grad_type = " [accent]" if grad.get('type') == 'accent' else ""
-        print(f"  {grad['direction']:>5} gradient: {len(chain):2d} colors, {chain_cov:5.1f}%, "
-              f"L={grad['l_range']:.0f} a={grad['a_range']:.0f} b={grad['b_range']:.0f}{grad_type}")
+        start_score = grad.get('starting_score', 0)
+        print(f"  {grad['direction']:>5}: {len(chain):2d} colors, {chain_cov:5.1f}%, "
+              f"L={grad['l_range']:.0f} a={grad['a_range']:.0f} b={grad['b_range']:.0f} "
+              f"(seed={start_score:.4f})")
 
-    # Visualize flow gradients (with accent markers)
+    # Visualize flow gradients
     flow_chains = [g['chain'] for g in flow_gradients]
     visualize_chains(flow_chains, coverage, total_pixels,
                      str(output_dir / f"{test_image.stem}_flow_gradients.png"),
@@ -1899,19 +1856,23 @@ if __name__ == '__main__':
     visualize_significance(significance, str(output_dir / f"{test_image.stem}_significance.png"),
                            scale=3.0, top_n=12)
 
-    # Show accent gradients summary
-    print("\n--- Accent Gradients (from significance seeding) ---")
-    accent_grads = [g for g in flow_gradients if g.get('type') == 'accent']
-    if accent_grads:
-        for grad in accent_grads:
+    # Show gradients seeded from dark/contrasting colors (L < 30)
+    print("\n--- Gradients with Dark Starting Points (L < 30) ---")
+    dark_seeded = []
+    for grad in flow_gradients:
+        first_lab = bin_to_lab(grad['chain'][0], 3.0)
+        if first_lab[0] < 30:
+            dark_seeded.append((grad, first_lab))
+
+    if dark_seeded:
+        for grad, first_lab in dark_seeded:
             chain = grad['chain']
             chain_cov = sum(coverage.get(b, 0) for b in chain) / total_pixels * 100
-            # Get LAB of first color in chain
-            first_lab = bin_to_lab(chain[0], 3.0)
             print(f"  {grad['direction']:>5}: {len(chain)} colors, {chain_cov:.2f}%, "
-                  f"starts at L={first_lab[0]:.1f} a={first_lab[1]:.1f} b={first_lab[2]:.1f}")
+                  f"starts at L={first_lab[0]:.1f} a={first_lab[1]:.1f} b={first_lab[2]:.1f} "
+                  f"(seed={grad.get('starting_score', 0):.4f})")
     else:
-        print("  (none found - all significant colors already in coverage-based gradients)")
+        print("  (none found - dark colors may not have strong directional flow)")
 
     # Check raw coverage for very dark bins
     print("\n--- Dark Bins in Raw Data (before filtering) ---")
