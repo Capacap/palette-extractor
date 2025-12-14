@@ -72,6 +72,20 @@ def build_adjacency_graph(binned: np.ndarray) -> tuple[dict, dict]:
             b2 = tuple(binned[y + 1, x])
             add_edge(b1, b2)
 
+    # Diagonal neighbors (down-right)
+    for y in range(h - 1):
+        for x in range(w - 1):
+            b1 = tuple(binned[y, x])
+            b2 = tuple(binned[y + 1, x + 1])
+            add_edge(b1, b2)
+
+    # Diagonal neighbors (down-left)
+    for y in range(h - 1):
+        for x in range(1, w):
+            b1 = tuple(binned[y, x])
+            b2 = tuple(binned[y + 1, x - 1])
+            add_edge(b1, b2)
+
     # Coverage
     flat = binned.reshape(-1, 3)
     unique, counts = np.unique(flat, axis=0, return_counts=True)
@@ -103,7 +117,10 @@ def build_directional_adjacency(binned: np.ndarray) -> dict:
             return
         key = (b1, b2)
         if key not in directional:
-            directional[key] = {'right': 0, 'left': 0, 'below': 0, 'above': 0}
+            directional[key] = {
+                'right': 0, 'left': 0, 'below': 0, 'above': 0,
+                'down_right': 0, 'down_left': 0, 'up_right': 0, 'up_left': 0
+            }
         directional[key][direction] += 1
 
     # Horizontal neighbors: pixel at (y, x) and (y, x+1)
@@ -125,6 +142,26 @@ def build_directional_adjacency(binned: np.ndarray) -> dict:
             add_directional(b_top, b_bottom, 'below')
             # b_top is ABOVE b_bottom
             add_directional(b_bottom, b_top, 'above')
+
+    # Diagonal neighbors (down-right): pixel at (y, x) and (y+1, x+1)
+    for y in range(h - 1):
+        for x in range(w - 1):
+            b_top_left = tuple(binned[y, x])
+            b_bottom_right = tuple(binned[y + 1, x + 1])
+            # b_bottom_right is DOWN_RIGHT of b_top_left
+            add_directional(b_top_left, b_bottom_right, 'down_right')
+            # b_top_left is UP_LEFT of b_bottom_right
+            add_directional(b_bottom_right, b_top_left, 'up_left')
+
+    # Diagonal neighbors (down-left): pixel at (y, x) and (y+1, x-1)
+    for y in range(h - 1):
+        for x in range(1, w):
+            b_top_right = tuple(binned[y, x])
+            b_bottom_left = tuple(binned[y + 1, x - 1])
+            # b_bottom_left is DOWN_LEFT of b_top_right
+            add_directional(b_top_right, b_bottom_left, 'down_left')
+            # b_top_right is UP_RIGHT of b_bottom_left
+            add_directional(b_bottom_left, b_top_right, 'up_right')
 
     return directional
 
@@ -431,8 +468,9 @@ def compute_spatial_coherence(binned: np.ndarray, colors: list,
             }
             continue
 
-        # Find connected components (4-connectivity)
-        labeled, num_blobs = label(mask)
+        # Find connected components (8-connectivity)
+        structure = np.ones((3, 3), dtype=int)
+        labeled, num_blobs = label(mask, structure=structure)
 
         if num_blobs == 0:
             results[b] = {
@@ -519,31 +557,44 @@ def analyze_gradient_flow(directional: dict, colors: list, coverage: dict,
     For each color pair, computes:
     - horizontal_flow: right - left (positive = flows right)
     - vertical_flow: below - above (positive = flows down)
+    - diag_dr_flow: down_right - up_left (positive = flows toward bottom-right)
+    - diag_dl_flow: down_left - up_right (positive = flows toward bottom-left)
 
     Returns dict with flow analysis for significant pairs.
     """
     flow_analysis = {}
 
     for (b1, b2), dirs in directional.items():
-        total = dirs['right'] + dirs['left'] + dirs['below'] + dirs['above']
+        total = (dirs['right'] + dirs['left'] + dirs['below'] + dirs['above'] +
+                 dirs['down_right'] + dirs['down_left'] + dirs['up_right'] + dirs['up_left'])
         if total < min_flow:
             continue
 
         h_flow = dirs['right'] - dirs['left']
         v_flow = dirs['below'] - dirs['above']
+        dr_flow = dirs['down_right'] - dirs['up_left']  # main diagonal
+        dl_flow = dirs['down_left'] - dirs['up_right']  # anti-diagonal
 
         # Compute flow strength (how asymmetric)
         h_total = dirs['right'] + dirs['left']
         v_total = dirs['below'] + dirs['above']
+        dr_total = dirs['down_right'] + dirs['up_left']
+        dl_total = dirs['down_left'] + dirs['up_right']
 
         h_asymmetry = abs(h_flow) / (h_total + 1) if h_total > 0 else 0
         v_asymmetry = abs(v_flow) / (v_total + 1) if v_total > 0 else 0
+        dr_asymmetry = abs(dr_flow) / (dr_total + 1) if dr_total > 0 else 0
+        dl_asymmetry = abs(dl_flow) / (dl_total + 1) if dl_total > 0 else 0
 
         flow_analysis[(b1, b2)] = {
             'h_flow': h_flow,
             'v_flow': v_flow,
+            'dr_flow': dr_flow,
+            'dl_flow': dl_flow,
             'h_asymmetry': h_asymmetry,
             'v_asymmetry': v_asymmetry,
+            'dr_asymmetry': dr_asymmetry,
+            'dl_asymmetry': dl_asymmetry,
             'total': total,
             'dirs': dirs
         }
@@ -584,7 +635,10 @@ def find_flow_gradients(colors: list, directional: dict, coverage: dict,
     # Build directed graph based on flow
     # Edge from A to B if B is predominantly in one direction from A
     # Weight edges by coherence: noisy transitions are less meaningful
-    flow_graph = {b: {'right': [], 'left': [], 'below': [], 'above': []} for b in colors}
+    flow_graph = {b: {
+        'right': [], 'left': [], 'below': [], 'above': [],
+        'down_right': [], 'down_left': [], 'up_right': [], 'up_left': []
+    } for b in colors}
 
     def get_coherence(b):
         """Get coherence for a color, defaulting to 1.0 if not available."""
@@ -622,6 +676,28 @@ def find_flow_gradients(colors: list, directional: dict, coverage: dict,
                 # b2 is predominantly ABOVE b1
                 weighted_flow = -analysis['v_flow'] * coherence_weight
                 flow_graph[b1]['above'].append((b2, weighted_flow, analysis['total']))
+
+        # Check main diagonal flow (down-right / up-left)
+        if analysis['dr_asymmetry'] > min_asymmetry:
+            if analysis['dr_flow'] > 0:
+                # b2 is predominantly DOWN_RIGHT of b1
+                weighted_flow = analysis['dr_flow'] * coherence_weight
+                flow_graph[b1]['down_right'].append((b2, weighted_flow, analysis['total']))
+            else:
+                # b2 is predominantly UP_LEFT of b1
+                weighted_flow = -analysis['dr_flow'] * coherence_weight
+                flow_graph[b1]['up_left'].append((b2, weighted_flow, analysis['total']))
+
+        # Check anti-diagonal flow (down-left / up-right)
+        if analysis['dl_asymmetry'] > min_asymmetry:
+            if analysis['dl_flow'] > 0:
+                # b2 is predominantly DOWN_LEFT of b1
+                weighted_flow = analysis['dl_flow'] * coherence_weight
+                flow_graph[b1]['down_left'].append((b2, weighted_flow, analysis['total']))
+            else:
+                # b2 is predominantly UP_RIGHT of b1
+                weighted_flow = -analysis['dl_flow'] * coherence_weight
+                flow_graph[b1]['up_right'].append((b2, weighted_flow, analysis['total']))
 
     # Sort neighbors by coherence-weighted flow strength
     for b in flow_graph:
@@ -690,7 +766,8 @@ def find_flow_gradients(colors: list, directional: dict, coverage: dict,
     used = set()
 
     # Single unified loop - try top colors by combined score
-    for direction in ['right', 'left', 'below', 'above']:
+    for direction in ['right', 'left', 'below', 'above',
+                      'down_right', 'down_left', 'up_right', 'up_left']:
         for start, start_score in scored_colors[:40]:  # Try more candidates
             if start in used:
                 continue
