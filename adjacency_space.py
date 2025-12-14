@@ -368,10 +368,10 @@ def compute_global_contrast(colors: list, coverage: dict, scale: float = 3.0,
     return global_contrast
 
 
-def analyze_significance(colors: list, adjacency: dict, coverage: dict,
-                         scale: float = 3.0) -> dict:
+def analyze_salience(colors: list, adjacency: dict, coverage: dict,
+                     scale: float = 3.0) -> dict:
     """
-    Analyze color significance using multiple metrics.
+    Analyze color salience using multiple metrics.
 
     Returns dict with per-color metrics:
     - coverage: fraction of image
@@ -443,7 +443,7 @@ def analyze_gradient_flow(directional: dict, colors: list, coverage: dict,
 def find_flow_gradients(colors: list, directional: dict, coverage: dict,
                         scale: float = 3.0, min_chain_length: int = 3,
                         min_asymmetry: float = 0.3,
-                        significance: dict = None) -> list[dict]:
+                        salience: dict = None) -> list[dict]:
     """
     Find gradients by following directional flow through the adjacency graph.
 
@@ -451,7 +451,7 @@ def find_flow_gradients(colors: list, directional: dict, coverage: dict,
     - Horizontal gradient: each color has the next color predominantly to its right (or left)
     - Vertical gradient: each color has the next color predominantly below (or above)
 
-    Starting points are selected by unified score: coverage + significance.
+    Starting points are selected by unified score: coverage + salience.
     Both high-coverage colors and high-contrast colors compete for gradient seeds.
     This naturally captures accent colors without a separate phase.
 
@@ -462,7 +462,7 @@ def find_flow_gradients(colors: list, directional: dict, coverage: dict,
         scale: JND scale for bin_to_lab
         min_chain_length: minimum chain length for valid gradients
         min_asymmetry: minimum flow asymmetry to follow an edge
-        significance: optional dict with per-color significance metrics
+        salience: optional dict with per-color salience metrics
             (if None, falls back to coverage-only ranking)
 
     Returns list of gradient dicts with chain, direction, and metadata.
@@ -525,35 +525,35 @@ def find_flow_gradients(colors: list, directional: dict, coverage: dict,
 
         return chain
 
-    # Compute unified starting score: coverage + significance
+    # Compute unified starting score: coverage + salience
     # Both high coverage and high contrast make a color important as gradient seed
     total_pixels = sum(coverage.values())
 
     def compute_starting_score(b):
-        """Unified score combining coverage and significance."""
+        """Unified score combining coverage and salience."""
         # Normalize coverage to 0-1
         cov_normalized = coverage.get(b, 0) / total_pixels
 
-        # Get significance metrics (if available)
-        if significance and b in significance:
-            stats = significance[b]
+        # Get salience metrics (if available)
+        if salience and b in salience:
+            stats = salience[b]
             # Normalize multihop contrast (typically 10-25 range) to ~0-1
             multihop = stats.get('multihop_contrast', 0) / 25.0
             # Global contrast already 0-1
             global_c = stats.get('global_contrast', 0)
-            # Combined significance: weight multihop more (it captures local contrast)
-            sig_normalized = multihop * 0.7 + global_c * 0.3
+            # Combined salience: weight multihop more (it captures local contrast)
+            sal_normalized = multihop * 0.7 + global_c * 0.3
         else:
-            sig_normalized = 0
+            sal_normalized = 0
 
-        # Unified score: coverage is primary, significance is secondary boost
+        # Unified score: coverage is primary, salience is secondary boost
         # Scale coverage to be competitive (max ~1.1 for 11% coverage)
-        # Significance adds a smaller boost (max ~0.15) so it can nudge rankings
+        # Salience adds a smaller boost (max ~0.15) so it can nudge rankings
         # but not completely override coverage
         cov_scaled = cov_normalized * 10  # 11% -> 1.1, 0.5% -> 0.05
-        sig_boost = sig_normalized * 0.15  # max 0.15 boost
+        sal_boost = sal_normalized * 0.15  # max 0.15 boost
 
-        return cov_scaled + sig_boost
+        return cov_scaled + sal_boost
 
     # Sort all colors by unified starting score
     scored_colors = [(b, compute_starting_score(b)) for b in colors]
@@ -1438,43 +1438,43 @@ def find_gradient_paths(embedding: np.ndarray, colors: list, adjacency: dict,
     return chains
 
 
-def extract_accent_colors(gradients: list[dict], significance: dict,
+def extract_accent_colors(gradients: list[dict], salience: dict,
                            min_multihop: float = 20.0, min_global: float = 0.8,
                            max_accents: int = 8) -> list[dict]:
     """
-    Extract significant colors that aren't captured by the gradients.
+    Extract salient colors that aren't captured by the gradients.
 
     These are "accent colors" - visually important due to contrast but too
     isolated or small to form gradient chains.
 
     Args:
         gradients: list of gradient dicts with 'chain' key
-        significance: dict from analyze_significance with multihop_contrast
-        min_multihop: minimum multi-hop contrast to be considered significant
-        min_global: minimum global contrast to be considered significant
+        salience: dict from analyze_salience with multihop_contrast
+        min_multihop: minimum multi-hop contrast to be considered salient
+        min_global: minimum global contrast to be considered salient
         max_accents: maximum accent colors to return
 
     Returns:
-        list of accent color dicts with bin, lab, and significance metrics
+        list of accent color dicts with bin, lab, and salience metrics
     """
     # Collect all colors already in gradients
     gradient_colors = set()
     for grad in gradients:
         gradient_colors.update(grad['chain'])
 
-    # Find significant colors not in gradients
+    # Find salient colors not in gradients
     accents = []
-    for bin_tuple, stats in significance.items():
+    for bin_tuple, stats in salience.items():
         if bin_tuple in gradient_colors:
             continue
 
-        # Check if significant by either metric
-        is_significant = (
+        # Check if salient by either metric
+        is_salient = (
             stats.get('multihop_contrast', 0) >= min_multihop or
             stats.get('global_contrast', 0) >= min_global
         )
 
-        if is_significant:
+        if is_salient:
             accents.append({
                 'bin': bin_tuple,
                 'lab': stats['lab'],
@@ -1484,16 +1484,16 @@ def extract_accent_colors(gradients: list[dict], significance: dict,
                 'chroma': stats['chroma']
             })
 
-    # Sort by combined significance (multi-hop weighted more since it captures local importance)
+    # Sort by combined salience (multi-hop weighted more since it captures local importance)
     accents.sort(key=lambda x: x['multihop_contrast'] * 2 + x['global_contrast'] * 20, reverse=True)
 
     return accents[:max_accents]
 
 
-def visualize_significance(significance: dict, output_path: str, scale: float = 3.0,
-                            top_n: int = 10):
+def visualize_salience(salience: dict, output_path: str, scale: float = 3.0,
+                       top_n: int = 10):
     """
-    Visualize significant colors as swatches, organized by metric.
+    Visualize salient colors as swatches, organized by metric.
 
     Creates a grid showing top colors by:
     - Coverage (dominant colors)
@@ -1508,9 +1508,9 @@ def visualize_significance(significance: dict, output_path: str, scale: float = 
     row_height = swatch_size + padding
 
     # Get top colors by each metric
-    by_coverage = sorted(significance.items(), key=lambda x: x[1]['coverage'], reverse=True)[:top_n]
-    by_multihop = sorted(significance.items(), key=lambda x: x[1]['multihop_contrast'], reverse=True)[:top_n]
-    by_global = sorted(significance.items(), key=lambda x: x[1]['global_contrast'], reverse=True)[:top_n]
+    by_coverage = sorted(salience.items(), key=lambda x: x[1]['coverage'], reverse=True)[:top_n]
+    by_multihop = sorted(salience.items(), key=lambda x: x[1]['multihop_contrast'], reverse=True)[:top_n]
+    by_global = sorted(salience.items(), key=lambda x: x[1]['global_contrast'], reverse=True)[:top_n]
 
     sections = [
         ("Top by Coverage", by_coverage),
@@ -1553,7 +1553,7 @@ def visualize_significance(significance: dict, output_path: str, scale: float = 
         y += row_height + 5
 
     img.save(output_path)
-    print(f"Saved significance swatches to {output_path}")
+    print(f"Saved salience swatches to {output_path}")
 
 
 def visualize_gradients_and_accents(gradients: list[dict], accents: list[dict],
@@ -1745,24 +1745,24 @@ if __name__ == '__main__':
     directional = build_directional_adjacency(binned)
     print(f"Directional pairs: {len(directional)}")
 
-    # Compute significance metrics FIRST (needed for flow gradient seeding)
-    print("\n--- Computing Significance Metrics ---")
-    significance = analyze_significance(colors, adjacency, coverage, scale=3.0)
+    # Compute salience metrics FIRST (needed for flow gradient seeding)
+    print("\n--- Computing Salience Metrics ---")
+    salience = analyze_salience(colors, adjacency, coverage, scale=3.0)
 
     # Compute multi-hop adjacency contrast (key for accent color detection)
     print("Computing multi-hop adjacency contrast...")
     multihop = compute_multihop_contrast(colors, adjacency, coverage, scale=3.0, max_hops=3)
 
-    # Add multi-hop to significance dict
+    # Add multi-hop to salience dict
     for b in colors:
-        significance[b]['multihop_contrast'] = multihop.get(b, 0)
+        salience[b]['multihop_contrast'] = multihop.get(b, 0)
 
-    # Find flow-based gradients with unified scoring (coverage + significance)
+    # Find flow-based gradients with unified scoring (coverage + salience)
     print("\n--- Directional Flow Method (unified scoring) ---")
     flow_gradients = find_flow_gradients(
         colors, directional, coverage,
         scale=3.0, min_chain_length=3, min_asymmetry=0.25,
-        significance=significance
+        salience=salience
     )
     print(f"Found {len(flow_gradients)} flow gradients")
 
@@ -1781,21 +1781,21 @@ if __name__ == '__main__':
                      max_chains=12, gradients=flow_gradients)
 
     # Compute pixel-level local contrast (for analysis)
-    print("\n--- Significance Analysis ---")
+    print("\n--- Salience Analysis ---")
     print("Computing pixel-level local contrast...")
     pixel_contrast = compute_pixel_local_contrast(lab, binned, colors, radius=5)
 
-    # Add pixel contrast to significance dict
+    # Add pixel contrast to salience dict
     for b in colors:
-        significance[b]['pixel_contrast'] = pixel_contrast.get(b, 0)
+        salience[b]['pixel_contrast'] = pixel_contrast.get(b, 0)
 
     # Show distribution of metrics
-    coverages = [s['coverage'] for s in significance.values()]
-    local_contrasts = [s['local_contrast'] for s in significance.values()]
-    pixel_contrasts = [s['pixel_contrast'] for s in significance.values()]
-    multihop_contrasts = [s['multihop_contrast'] for s in significance.values()]
-    global_contrasts = [s['global_contrast'] for s in significance.values()]
-    chromas = [s['chroma'] for s in significance.values()]
+    coverages = [s['coverage'] for s in salience.values()]
+    local_contrasts = [s['local_contrast'] for s in salience.values()]
+    pixel_contrasts = [s['pixel_contrast'] for s in salience.values()]
+    multihop_contrasts = [s['multihop_contrast'] for s in salience.values()]
+    global_contrasts = [s['global_contrast'] for s in salience.values()]
+    chromas = [s['chroma'] for s in salience.values()]
 
     print(f"Coverage:        min={min(coverages):.4f}, max={max(coverages):.4f}, mean={np.mean(coverages):.4f}")
     print(f"Local contrast (1-hop adj):  min={min(local_contrasts):.1f}, max={max(local_contrasts):.1f}, mean={np.mean(local_contrasts):.1f}")
@@ -1804,21 +1804,21 @@ if __name__ == '__main__':
     print(f"Global contrast: min={min(global_contrasts):.2f}, max={max(global_contrasts):.2f}, mean={np.mean(global_contrasts):.2f}")
     print(f"Chroma:          min={min(chromas):.1f}, max={max(chromas):.1f}, mean={np.mean(chromas):.1f}")
 
-    # Find colors that are significant by different metrics
+    # Find colors that are salient by different metrics
     print("\n--- Top Colors by Coverage ---")
-    by_coverage = sorted(significance.items(), key=lambda x: x[1]['coverage'], reverse=True)[:5]
+    by_coverage = sorted(salience.items(), key=lambda x: x[1]['coverage'], reverse=True)[:5]
     for b, s in by_coverage:
         print(f"  L={s['lab'][0]:5.1f} a={s['lab'][1]:5.1f} b={s['lab'][2]:5.1f}  "
               f"cov={s['coverage']:.3f} local={s['local_contrast']:.1f} global={s['global_contrast']:.2f}")
 
     print("\n--- Top Colors by Local Contrast ---")
-    by_local = sorted(significance.items(), key=lambda x: x[1]['local_contrast'], reverse=True)[:5]
+    by_local = sorted(salience.items(), key=lambda x: x[1]['local_contrast'], reverse=True)[:5]
     for b, s in by_local:
         print(f"  L={s['lab'][0]:5.1f} a={s['lab'][1]:5.1f} b={s['lab'][2]:5.1f}  "
               f"cov={s['coverage']:.3f} local={s['local_contrast']:.1f} global={s['global_contrast']:.2f}")
 
     print("\n--- Top Colors by Global Contrast (Rare in Palette) ---")
-    by_global = sorted(significance.items(), key=lambda x: x[1]['global_contrast'], reverse=True)[:5]
+    by_global = sorted(salience.items(), key=lambda x: x[1]['global_contrast'], reverse=True)[:5]
     for b, s in by_global:
         print(f"  L={s['lab'][0]:5.1f} a={s['lab'][1]:5.1f} b={s['lab'][2]:5.1f}  "
               f"cov={s['coverage']:.3f} local={s['local_contrast']:.1f} global={s['global_contrast']:.2f}")
@@ -1828,7 +1828,7 @@ if __name__ == '__main__':
     max_local = max(local_contrasts)
     max_cov = max(coverages)
     edge_colors = [
-        (b, s) for b, s in significance.items()
+        (b, s) for b, s in salience.items()
         if s['local_contrast'] / max_local > 0.5 and s['coverage'] / max_cov < 0.1
     ]
     edge_colors.sort(key=lambda x: x[1]['local_contrast'], reverse=True)
@@ -1837,7 +1837,7 @@ if __name__ == '__main__':
               f"cov={s['coverage']:.4f} local={s['local_contrast']:.1f} global={s['global_contrast']:.2f}")
 
     print("\n--- Darkest Colors (L < 25) ---")
-    dark_colors = [(b, s) for b, s in significance.items() if s['lab'][0] < 25]
+    dark_colors = [(b, s) for b, s in salience.items() if s['lab'][0] < 25]
     dark_colors.sort(key=lambda x: x[1]['lab'][0])
     if dark_colors:
         for b, s in dark_colors[:8]:
@@ -1847,14 +1847,14 @@ if __name__ == '__main__':
         print("  (none found - may be filtered by min_coverage)")
 
     print("\n--- Top Colors by Multi-Hop Contrast ---")
-    by_multihop = sorted(significance.items(), key=lambda x: x[1]['multihop_contrast'], reverse=True)[:8]
+    by_multihop = sorted(salience.items(), key=lambda x: x[1]['multihop_contrast'], reverse=True)[:8]
     for b, s in by_multihop:
         print(f"  L={s['lab'][0]:5.1f} a={s['lab'][1]:5.1f} b={s['lab'][2]:5.1f}  "
               f"cov={s['coverage']:.4f} 1hop={s['local_contrast']:.1f} 3hop={s['multihop_contrast']:.1f} global={s['global_contrast']:.2f}")
 
-    # Visualize significant colors
-    visualize_significance(significance, str(output_dir / f"{test_image.stem}_significance.png"),
-                           scale=3.0, top_n=12)
+    # Visualize salient colors
+    visualize_salience(salience, str(output_dir / f"{test_image.stem}_salience.png"),
+                       scale=3.0, top_n=12)
 
     # Show gradients seeded from dark/contrasting colors (L < 30)
     print("\n--- Gradients with Dark Starting Points (L < 30) ---")

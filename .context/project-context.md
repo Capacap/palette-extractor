@@ -1,22 +1,34 @@
 # Color Palette Extractor
 
-Single-file Python script to extract color palettes from images.
+Tools for extracting and analyzing color relationships in images.
+
+## Goal
+
+Map the color space of an image: understand what colors exist and how they relate to each other spatially and perceptually. Gradients and palettes are views into this underlying structure.
 
 ## Approach
 
-### Stage 1: Perceptual Quantization
+### Perceptual Quantization
 Bin pixels into JND-sized buckets (2.3 LAB units) to get all perceptually distinct colors.
 
-### Stage 2: Chromaticity Grouping
-Group colors by chromaticity (a, b) ignoring lightness. This merges different brightness levels of the same hue into families. Uses greedy clustering from largest to smallest.
+### Adjacency Graph
+Build a graph where colors are nodes and edges represent spatial adjacency. Track directional flow (which color appears to the right/left/above/below of another).
 
-### Stage 3: Shade Extraction
-For families with enough coverage (>1%) and lightness range (>30 L units), extract shadow/midtone/highlight shades. Smaller families get a single midtone.
+### Salience Metrics
+Measure how much each color "stands out":
+- **Multi-hop contrast**: LAB distance to colors reachable within 3 hops
+- **Global contrast**: Inverse density in LAB space (rare colors score high)
+- **Local contrast**: Average LAB distance to spatial neighbors
+
+### Color Relationships
+Use adjacency + salience to understand:
+- Which colors transition into each other (gradients)
+- Which colors are isolated/accent colors
+- Spatial structure of color distribution
 
 ## Key Design Decisions
 
 - **LAB color space**: Perceptually uniform, separates lightness from chromaticity
 - **JND binning**: 2.3 LAB units = Just Noticeable Difference, grounded in perception science
-- **Chromaticity-only grouping**: Different brightnesses of same hue belong together
-- **Coverage-based filtering**: 0.01% minimum filters noise, scales with image size
-- **Adaptive shading**: Only split families that have enough data to warrant it
+- **Graph-based analysis**: Colors understood through their relationships, not in isolation
+- **Unified scoring**: Coverage and salience compete fairly for importance
