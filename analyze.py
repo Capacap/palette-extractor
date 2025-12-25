@@ -1640,11 +1640,11 @@ def render_html(synthesis: SynthesisResult, features: FeatureData, image_path: s
 # Main Pipeline
 # =============================================================================
 
-def analyze_image(image_path: str) -> tuple[str, str]:
-    """Run the full analysis pipeline on an image.
+def run_pipeline(image_path: str) -> tuple[SynthesisResult, FeatureData]:
+    """Run analysis pipeline stages 1-3.
 
     Returns:
-        Tuple of (prose_output, html_output)
+        Tuple of (synthesis_result, feature_data) for rendering.
     """
     # Stage 1: Data Preparation
     data = prepare_data(image_path)
@@ -1655,10 +1655,18 @@ def analyze_image(image_path: str) -> tuple[str, str]:
     # Stage 3: Synthesis
     synthesis = synthesize(data, features)
 
-    # Stage 4: Render
+    return synthesis, features
+
+
+def analyze_image(image_path: str) -> tuple[str, str]:
+    """Run the full analysis pipeline on an image.
+
+    Returns:
+        Tuple of (prose_output, html_output)
+    """
+    synthesis, features = run_pipeline(image_path)
     prose = render(synthesis, features)
     html = render_html(synthesis, features, image_path)
-
     return prose, html
 
 
