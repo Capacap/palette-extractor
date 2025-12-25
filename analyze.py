@@ -1371,12 +1371,281 @@ def render(synthesis: SynthesisResult, features: FeatureData) -> str:
     return "\n".join(lines)
 
 
+def text_color_for_background(L: float) -> str:
+    """Return black or white text color based on background lightness."""
+    return "#000" if L > 50 else "#fff"
+
+
+def render_html(synthesis: SynthesisResult, features: FeatureData, image_path: str) -> str:
+    """Stage 4b: Render synthesis result as HTML."""
+    from html import escape
+
+    safe_path = escape(image_path)
+
+    # Build name-to-hex lookup once for contrast/harmonic pairs
+    name_to_hex = {c.name: c.hex for c in synthesis.notable_colors}
+
+    # CSS styles
+    css = """
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            background: #f5f5f5;
+            color: #333;
+            line-height: 1.5;
+            padding: 2rem;
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
+        h2 { font-size: 1.2rem; margin: 2rem 0 1rem; border-bottom: 1px solid #ddd; padding-bottom: 0.5rem; }
+        .meta { color: #666; font-size: 0.9rem; margin-bottom: 1rem; }
+        .palette-strip {
+            display: flex;
+            height: 80px;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            margin: 1.5rem 0;
+        }
+        .palette-strip .swatch {
+            display: flex;
+            align-items: flex-end;
+            justify-content: center;
+            padding: 0.5rem;
+            font-size: 0.7rem;
+            font-weight: 500;
+        }
+        .color-card {
+            background: #fff;
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+            display: grid;
+            grid-template-columns: 60px 1fr;
+            gap: 1rem;
+        }
+        .color-card .swatch {
+            width: 60px;
+            height: 60px;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.65rem;
+            font-weight: 600;
+        }
+        .color-card .info { font-size: 0.85rem; }
+        .color-card .role { font-weight: 600; text-transform: capitalize; }
+        .color-card .name { color: #666; }
+        .color-card .values { font-family: monospace; color: #555; font-size: 0.8rem; }
+        .color-card .chars { font-style: italic; color: #777; margin-top: 0.25rem; }
+        .gradient-block {
+            background: #fff;
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        }
+        .gradient-bar {
+            height: 40px;
+            border-radius: 6px;
+            margin-bottom: 1rem;
+        }
+        .gradient-stops {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+        .gradient-stop {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.8rem;
+        }
+        .gradient-stop .swatch {
+            width: 24px;
+            height: 24px;
+            border-radius: 4px;
+        }
+        .gradient-meta { font-size: 0.85rem; color: #666; margin-top: 0.75rem; }
+        .contrast-pair {
+            background: #fff;
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 0.75rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        }
+        .contrast-demo {
+            padding: 1rem;
+            border-radius: 6px;
+            margin-bottom: 0.5rem;
+            font-size: 1.1rem;
+        }
+        .contrast-demo .sample { font-weight: 600; }
+        .contrast-info { font-size: 0.85rem; color: #666; }
+        .contrast-badge {
+            display: inline-block;
+            padding: 0.15rem 0.4rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            margin-left: 0.5rem;
+        }
+        .badge-aaa { background: #22c55e; color: #fff; }
+        .badge-aa { background: #3b82f6; color: #fff; }
+        .badge-aa-large { background: #f59e0b; color: #fff; }
+        .badge-fail { background: #ef4444; color: #fff; }
+        .harmonic-pair {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 0.5rem;
+            font-size: 0.9rem;
+        }
+        .harmonic-pair .swatch {
+            width: 20px;
+            height: 20px;
+            border-radius: 4px;
+        }
+        .distribution { font-size: 0.9rem; color: #555; margin-top: 1rem; }
+    """
+
+    # Build HTML
+    lines = [
+        '<!DOCTYPE html>',
+        '<html lang="en">',
+        '<head>',
+        '  <meta charset="UTF-8">',
+        '  <meta name="viewport" content="width=device-width, initial-scale=1.0">',
+        f'  <title>Palette: {safe_path}</title>',
+        f'  <style>{css}</style>',
+        '</head>',
+        '<body>',
+    ]
+
+    # Header
+    lines.append(f'<h1>{synthesis.scheme_type}</h1>')
+    lines.append(f'<p class="meta">{synthesis.scheme_description}</p>')
+    lines.append(f'<p class="meta">Source: {safe_path}</p>')
+    lines.append(f'<p class="meta">Lightness: {synthesis.lightness_range[0]:.0f}–{synthesis.lightness_range[1]:.0f} | '
+                 f'Chroma: {synthesis.chroma_range[0]:.0f}–{synthesis.chroma_range[1]:.0f} | '
+                 f'{len(synthesis.notable_colors)} colors</p>')
+
+    # Palette strip
+    lines.append('<div class="palette-strip">')
+    total_coverage = sum(c.coverage for c in synthesis.notable_colors) or 1
+    for color in synthesis.notable_colors:
+        width_pct = max(5, (color.coverage / total_coverage) * 100)  # min 5% for visibility
+        text_color = text_color_for_background(color.lab[0])
+        lines.append(f'  <div class="swatch" style="background:{color.hex}; color:{text_color}; flex:{width_pct:.1f}">{color.hex}</div>')
+    lines.append('</div>')
+
+    # Color details
+    lines.append('<h2>Colors</h2>')
+    for color in synthesis.notable_colors:
+        text_color = text_color_for_background(color.lab[0])
+        coverage_str = f"{color.coverage*100:.1f}%" if color.coverage >= 0.001 else "<0.1%"
+        lines.append('<div class="color-card">')
+        lines.append(f'  <div class="swatch" style="background:{color.hex}; color:{text_color}">{color.hex}</div>')
+        lines.append('  <div class="info">')
+        lines.append(f'    <span class="role">{color.role}</span> <span class="name">{color.name}</span>')
+        lines.append(f'    <div class="values">RGB{color.rgb} · LAB({color.lab[0]:.0f}, {color.lab[1]:.0f}, {color.lab[2]:.0f})</div>')
+        lines.append(f'    <div class="values">Coverage: {coverage_str} · Chroma: {color.chroma:.0f}</div>')
+        if color.characteristics:
+            lines.append(f'    <div class="chars">{". ".join(color.characteristics)}.</div>')
+        lines.append('  </div>')
+        lines.append('</div>')
+
+    # Gradients
+    if synthesis.gradients:
+        lines.append('<h2>Gradients</h2>')
+        for grad in synthesis.gradients:
+            # Build gradient CSS
+            stops_css = []
+            stop_info = []
+            for i, stop in enumerate(grad.stops):
+                metrics = features.metrics.get(stop)
+                if metrics:
+                    hex_val = lab_to_hex(metrics.lab)
+                    name = generate_color_name(metrics.lab)
+                    pct = (i / max(1, len(grad.stops) - 1)) * 100
+                    stops_css.append(f"{hex_val} {pct:.0f}%")
+                    stop_info.append((hex_val, name, metrics.lab))
+
+            # Skip if no valid stops found
+            if not stop_info:
+                continue
+
+            gradient_css = f"linear-gradient(to right, {', '.join(stops_css)})"
+
+            lines.append('<div class="gradient-block">')
+            lines.append(f'  <div class="gradient-bar" style="background:{gradient_css}"></div>')
+            lines.append('  <div class="gradient-stops">')
+            for hex_val, name, _ in stop_info:
+                lines.append(f'    <div class="gradient-stop"><div class="swatch" style="background:{hex_val}"></div>{name}</div>')
+            lines.append('  </div>')
+            L_range = grad.lab_range['L'][1] - grad.lab_range['L'][0]
+            lines.append(f'  <div class="gradient-meta">Direction: {grad.direction} · Coverage: {grad.coverage*100:.1f}% · '
+                        f'Lightness span: {L_range:.0f}</div>')
+            lines.append('</div>')
+
+    # Relationships
+    lines.append('<h2>Relationships</h2>')
+
+    # Contrast pairs
+    if synthesis.contrast_pairs:
+        lines.append('<h3 style="font-size:1rem; margin:1rem 0 0.5rem;">Contrast Pairs</h3>')
+        for pair in synthesis.contrast_pairs:
+            bg_hex = name_to_hex.get(pair.color_a, '#888')
+            fg_hex = name_to_hex.get(pair.color_b, '#fff')
+
+            badge_class = {
+                'AAA': 'badge-aaa',
+                'AA': 'badge-aa',
+                'AA-large': 'badge-aa-large',
+            }.get(pair.wcag_level, 'badge-fail')
+
+            lines.append('<div class="contrast-pair">')
+            lines.append(f'  <div class="contrast-demo" style="background:{bg_hex}; color:{fg_hex}">')
+            lines.append(f'    <span class="sample">Aa</span> Sample text for readability')
+            lines.append('  </div>')
+            lines.append(f'  <div class="contrast-info">{pair.color_a} / {pair.color_b}: '
+                        f'{pair.contrast_ratio:.1f}:1 <span class="contrast-badge {badge_class}">{pair.wcag_level}</span></div>')
+            lines.append('</div>')
+
+    # Harmonic pairs
+    if synthesis.harmonic_pairs:
+        lines.append('<h3 style="font-size:1rem; margin:1rem 0 0.5rem;">Harmonic Pairs</h3>')
+        for pair in synthesis.harmonic_pairs:
+            hex_a = name_to_hex.get(pair.color_a, '#888')
+            hex_b = name_to_hex.get(pair.color_b, '#888')
+            lines.append('<div class="harmonic-pair">')
+            lines.append(f'  <div class="swatch" style="background:{hex_a}"></div>')
+            lines.append(f'  <div class="swatch" style="background:{hex_b}"></div>')
+            lines.append(f'  <span>{pair.color_a} and {pair.color_b}: {pair.hue_difference:.0f}° apart</span>')
+            lines.append('</div>')
+
+    # Distribution
+    lines.append(f'<p class="distribution"><strong>Distribution:</strong> {synthesis.distribution_analysis}</p>')
+
+    lines.append('</body>')
+    lines.append('</html>')
+
+    return '\n'.join(lines)
+
+
 # =============================================================================
 # Main Pipeline
 # =============================================================================
 
-def analyze_image(image_path: str) -> str:
-    """Run the full analysis pipeline on an image."""
+def analyze_image(image_path: str) -> tuple[str, str]:
+    """Run the full analysis pipeline on an image.
+
+    Returns:
+        Tuple of (prose_output, html_output)
+    """
     # Stage 1: Data Preparation
     data = prepare_data(image_path)
 
@@ -1387,9 +1656,10 @@ def analyze_image(image_path: str) -> str:
     synthesis = synthesize(data, features)
 
     # Stage 4: Render
-    output = render(synthesis, features)
+    prose = render(synthesis, features)
+    html = render_html(synthesis, features, image_path)
 
-    return output
+    return prose, html
 
 
 # =============================================================================
@@ -1397,26 +1667,52 @@ def analyze_image(image_path: str) -> str:
 # =============================================================================
 
 if __name__ == '__main__':
+    import argparse
     import sys
+    from pathlib import Path
 
-    if len(sys.argv) < 2:
-        print("Usage: python analyze.py <image_path>")
-        print("       python analyze.py --batch <directory>")
+    parser = argparse.ArgumentParser(
+        description='Analyze an image and extract its color palette.'
+    )
+    parser.add_argument(
+        '--input', '-i',
+        required=True,
+        help='Path to the image file'
+    )
+    parser.add_argument(
+        '--output', '-o',
+        nargs='?',
+        const=True,
+        default=None,
+        help='Write HTML report. Optionally specify path, otherwise auto-names from input.'
+    )
+
+    args = parser.parse_args()
+    image_path = Path(args.input)
+
+    # Run analysis
+    try:
+        prose, html = analyze_image(str(image_path))
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error analyzing image: {e}", file=sys.stderr)
         sys.exit(1)
 
-    if sys.argv[1] == '--batch':
-        from pathlib import Path
+    # Always print prose to terminal
+    print(prose)
 
-        directory = Path(sys.argv[2]) if len(sys.argv) > 2 else Path('source_images')
+    # Write HTML if requested
+    if args.output:
+        if args.output is True:
+            output_path = image_path.with_name(f"{image_path.stem}-palette.html")
+        else:
+            output_path = Path(args.output)
 
-        for image_path in sorted(directory.glob('*.jpeg')) + sorted(directory.glob('*.png')) + sorted(directory.glob('*.jpg')):
-            print(f"\n{'='*70}")
-            print(f"IMAGE: {image_path.name}")
-            print('='*70)
-            print()
-
-            result = analyze_image(str(image_path))
-            print(result)
-    else:
-        result = analyze_image(sys.argv[1])
-        print(result)
+        try:
+            output_path.write_text(html)
+            print(f"\nWrote: {output_path}")
+        except OSError as e:
+            print(f"Error writing output: {e}", file=sys.stderr)
+            sys.exit(1)
