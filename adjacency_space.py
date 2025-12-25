@@ -414,7 +414,8 @@ def compute_color_metrics(colors: list, adjacency: dict, coverage: dict,
     - coverage: fraction of image
     - local_contrast: stands out from spatial neighbors
     - global_contrast: stands out from overall palette
-    - chroma: saturation level
+    - chroma: saturation level (sqrt(a² + b²))
+    - hue: hue angle in degrees (0-360, via atan2(b, a))
     - lab: LAB coordinates
     """
     total_pixels = sum(coverage.values())
@@ -426,12 +427,14 @@ def compute_color_metrics(colors: list, adjacency: dict, coverage: dict,
     for b in colors:
         lab = bin_to_lab(b, scale)
         chroma = np.sqrt(lab[1]**2 + lab[2]**2)
+        hue = np.degrees(np.arctan2(lab[2], lab[1])) % 360  # 0-360 degrees
 
         results[b] = {
             'coverage': coverage.get(b, 0) / total_pixels,
             'local_contrast': local.get(b, 0),
             'global_contrast': global_c.get(b, 0),
             'chroma': chroma,
+            'hue': hue,
             'lab': lab
         }
 
@@ -547,6 +550,328 @@ def identify_noise_colors(coherence: dict, coverage: dict,
             noise.add(b)
 
     return noise, median_coherence
+
+
+def classify_color_scheme(color_metrics: dict, min_coverage: float = 0.001) -> dict:
+    """
+    Classify the color scheme of an image based on hue/chroma distribution.
+
+    Uses relative thresholds based on the image's own chroma distribution,
+    so it works on everything from grayscale to highly saturated images.
+
+    Scheme types:
+    - achromatic: no significant chromatic content
+    - neutral_accent: mostly neutral with small chromatic accent(s)
+    - monochromatic: single hue family
+    - analogous: adjacent hues (<90° spread)
+    - analogous_accent: analogous base + complementary accent
+    - complementary: two hue clusters ~180° apart
+    - triadic: three hue clusters ~120° apart
+    - complex: doesn't fit simple categories
+
+    Returns dict with:
+    - scheme_type: classification label
+    - chroma_profile: analysis of saturation distribution
+    - chromatic_colors: colors above chroma threshold
+    - neutral_colors: colors below chroma threshold
+    - hue_clusters: detected hue groupings (if chromatic)
+    - dominant_hue: main hue angle (if applicable)
+    - accent_hue: outlier hue (if applicable)
+    - lightness_range: (min_L, max_L) of significant colors
+    """
+    # Filter to significant colors
+    significant = {b: m for b, m in color_metrics.items()
+                   if m['coverage'] >= min_coverage}
+
+    if not significant:
+        return {
+            'scheme_type': 'unknown',
+            'chroma_profile': {'type': 'unknown'},
+            'chromatic_colors': [],
+            'neutral_colors': [],
+            'hue_clusters': [],
+            'lightness_range': (0, 100),
+        }
+
+    # Compute coverage-weighted chroma statistics
+    total_coverage = sum(m['coverage'] for m in significant.values())
+    chromas = []
+    weights = []
+    for b, m in significant.items():
+        chromas.append(m['chroma'])
+        weights.append(m['coverage'] / total_coverage)
+
+    chromas = np.array(chromas)
+    weights = np.array(weights)
+
+    # Weighted percentiles for chroma
+    sorted_idx = np.argsort(chromas)
+    sorted_chromas = chromas[sorted_idx]
+    sorted_weights = weights[sorted_idx]
+    cumsum = np.cumsum(sorted_weights)
+
+    median_chroma = sorted_chromas[np.searchsorted(cumsum, 0.5)]
+    p25_chroma = sorted_chromas[np.searchsorted(cumsum, 0.25)]
+    p75_chroma = sorted_chromas[np.searchsorted(cumsum, 0.75)]
+    max_chroma = np.max(chromas)
+
+    # Classify chroma profile
+    if median_chroma < 10 and max_chroma < 20:
+        chroma_type = 'achromatic'
+    elif median_chroma < 15:
+        chroma_type = 'low_chroma'
+    elif (p75_chroma - p25_chroma) > 25:
+        chroma_type = 'mixed'
+    else:
+        chroma_type = 'chromatic'
+
+    chroma_profile = {
+        'type': chroma_type,
+        'median': float(median_chroma),
+        'max': float(max_chroma),
+        'iqr': float(p75_chroma - p25_chroma),
+    }
+
+    # Adaptive threshold for chromatic vs neutral
+    # Use 50% of median, but at least 10 (absolute floor for "has color")
+    chroma_threshold = max(10, median_chroma * 0.5)
+    chroma_profile['threshold'] = float(chroma_threshold)
+
+    # Separate chromatic and neutral colors
+    chromatic_colors = []
+    neutral_colors = []
+    for b, m in significant.items():
+        if m['chroma'] >= chroma_threshold:
+            chromatic_colors.append((b, m))
+        else:
+            neutral_colors.append((b, m))
+
+    # Compute lightness range
+    all_L = [m['lab'][0] for m in significant.values()]
+    lightness_range = (float(min(all_L)), float(max(all_L)))
+
+    # If no chromatic colors, it's achromatic
+    if not chromatic_colors:
+        return {
+            'scheme_type': 'achromatic',
+            'chroma_profile': chroma_profile,
+            'chromatic_colors': [],
+            'neutral_colors': [b for b, m in neutral_colors],
+            'hue_clusters': [],
+            'lightness_range': lightness_range,
+        }
+
+    # Cluster chromatic colors by hue using weighted circular histogram
+    hue_clusters = _cluster_hues_circular(chromatic_colors)
+
+    # Determine scheme type based on chroma profile and hue clusters
+    scheme_type, dominant_hue, accent_hue = _classify_from_clusters(
+        chroma_type, hue_clusters, chromatic_colors, neutral_colors
+    )
+
+    result = {
+        'scheme_type': scheme_type,
+        'chroma_profile': chroma_profile,
+        'chromatic_colors': [b for b, m in chromatic_colors],
+        'neutral_colors': [b for b, m in neutral_colors],
+        'hue_clusters': hue_clusters,
+        'lightness_range': lightness_range,
+    }
+
+    if dominant_hue is not None:
+        result['dominant_hue'] = dominant_hue
+    if accent_hue is not None:
+        result['accent_hue'] = accent_hue
+
+    return result
+
+
+def _cluster_hues_circular(chromatic_colors: list) -> list[dict]:
+    """
+    Cluster hues using circular peak detection on coverage-weighted histogram.
+
+    Returns list of clusters, each with:
+    - center: hue angle (0-360)
+    - spread: angular spread of cluster
+    - coverage: total coverage of colors in cluster
+    - colors: list of color bins in this cluster
+    """
+    if not chromatic_colors:
+        return []
+
+    # Build coverage-weighted circular histogram (36 bins of 10° each)
+    n_bins = 36
+    bin_width = 360 / n_bins
+    histogram = np.zeros(n_bins)
+    color_bins = [[] for _ in range(n_bins)]  # track which colors in each bin
+
+    for b, m in chromatic_colors:
+        hue = m['hue']
+        coverage = m['coverage']
+        bin_idx = int(hue / bin_width) % n_bins
+        histogram[bin_idx] += coverage
+        color_bins[bin_idx].append(b)
+
+    # Smooth histogram to reduce noise (circular convolution)
+    kernel = np.array([0.1, 0.2, 0.4, 0.2, 0.1])
+    smoothed = np.convolve(np.tile(histogram, 3), kernel, mode='same')[n_bins:2*n_bins]
+
+    # Find peaks (local maxima)
+    peaks = []
+    for i in range(n_bins):
+        prev_i = (i - 1) % n_bins
+        next_i = (i + 1) % n_bins
+        if smoothed[i] > smoothed[prev_i] and smoothed[i] > smoothed[next_i]:
+            if smoothed[i] > 0.01:  # ignore tiny peaks
+                peaks.append(i)
+
+    if not peaks:
+        # No clear peaks - treat all chromatic as one cluster
+        total_cov = sum(m['coverage'] for b, m in chromatic_colors)
+        # Circular mean of hues
+        sin_sum = sum(m['coverage'] * np.sin(np.radians(m['hue']))
+                      for b, m in chromatic_colors)
+        cos_sum = sum(m['coverage'] * np.cos(np.radians(m['hue']))
+                      for b, m in chromatic_colors)
+        mean_hue = np.degrees(np.arctan2(sin_sum, cos_sum)) % 360
+
+        return [{
+            'center': float(mean_hue),
+            'spread': 360.0,  # unknown spread
+            'coverage': float(total_cov),
+            'colors': [b for b, m in chromatic_colors]
+        }]
+
+    # Assign colors to nearest peak (circular distance)
+    clusters = {peak: {'colors': [], 'coverage': 0.0} for peak in peaks}
+
+    for b, m in chromatic_colors:
+        hue = m['hue']
+        coverage = m['coverage']
+
+        # Find nearest peak
+        min_dist = float('inf')
+        nearest_peak = peaks[0]
+        for peak in peaks:
+            peak_hue = (peak + 0.5) * bin_width
+            dist = min(abs(hue - peak_hue), 360 - abs(hue - peak_hue))
+            if dist < min_dist:
+                min_dist = dist
+                nearest_peak = peak
+
+        clusters[nearest_peak]['colors'].append((b, m))
+        clusters[nearest_peak]['coverage'] += coverage
+
+    # Convert to output format with proper hue centers
+    result = []
+    for peak, data in clusters.items():
+        if not data['colors']:
+            continue
+
+        # Compute circular mean hue for this cluster
+        sin_sum = sum(m['coverage'] * np.sin(np.radians(m['hue']))
+                      for b, m in data['colors'])
+        cos_sum = sum(m['coverage'] * np.cos(np.radians(m['hue']))
+                      for b, m in data['colors'])
+        center = np.degrees(np.arctan2(sin_sum, cos_sum)) % 360
+
+        # Compute spread (max angular distance from center)
+        max_dist = 0
+        for b, m in data['colors']:
+            dist = min(abs(m['hue'] - center), 360 - abs(m['hue'] - center))
+            max_dist = max(max_dist, dist)
+
+        result.append({
+            'center': float(center),
+            'spread': float(max_dist * 2),  # diameter
+            'coverage': float(data['coverage']),
+            'colors': [b for b, m in data['colors']]
+        })
+
+    # Sort by coverage (dominant first)
+    result.sort(key=lambda c: c['coverage'], reverse=True)
+    return result
+
+
+def _classify_from_clusters(chroma_type: str, hue_clusters: list,
+                            chromatic_colors: list, neutral_colors: list) -> tuple:
+    """
+    Determine scheme type from chroma profile and hue clusters.
+
+    Returns (scheme_type, dominant_hue, accent_hue)
+    """
+    n_clusters = len(hue_clusters)
+    total_chromatic = sum(m['coverage'] for b, m in chromatic_colors)
+    total_neutral = sum(m['coverage'] for b, m in neutral_colors)
+    chromatic_ratio = total_chromatic / (total_chromatic + total_neutral) if (total_chromatic + total_neutral) > 0 else 0
+
+    # No clusters = achromatic (shouldn't happen if we have chromatic colors)
+    if n_clusters == 0:
+        return 'achromatic', None, None
+
+    dominant = hue_clusters[0]
+    dominant_hue = dominant['center']
+
+    # Single cluster
+    if n_clusters == 1:
+        spread = dominant['spread']
+        if spread < 60:
+            if chromatic_ratio < 0.3:
+                return 'neutral_accent', dominant_hue, None
+            return 'monochromatic', dominant_hue, None
+        elif spread < 90:
+            return 'analogous', dominant_hue, None
+        else:
+            return 'complex', dominant_hue, None
+
+    # Two clusters
+    if n_clusters == 2:
+        second = hue_clusters[1]
+        second_hue = second['center']
+
+        # Angular distance between clusters
+        angular_dist = min(abs(dominant_hue - second_hue),
+                          360 - abs(dominant_hue - second_hue))
+
+        # Coverage ratio of smaller to larger
+        coverage_ratio = second['coverage'] / dominant['coverage'] if dominant['coverage'] > 0 else 0
+
+        # Small secondary cluster = accent
+        if coverage_ratio < 0.25:
+            if angular_dist > 120:
+                return 'analogous_accent', dominant_hue, second_hue
+            else:
+                return 'analogous', dominant_hue, None
+
+        # Two roughly equal clusters
+        if angular_dist > 150:
+            return 'complementary', dominant_hue, second_hue
+        elif angular_dist < 90:
+            return 'analogous', dominant_hue, None
+        else:
+            # Split-complementary territory
+            return 'split_complementary', dominant_hue, second_hue
+
+    # Three clusters
+    if n_clusters == 3:
+        # Check if roughly triadic (120° apart)
+        hues = sorted([c['center'] for c in hue_clusters])
+        gaps = [(hues[1] - hues[0]) % 360,
+                (hues[2] - hues[1]) % 360,
+                (hues[0] - hues[2]) % 360]
+
+        # Triadic if gaps are roughly equal (100-140° each)
+        if all(80 < g < 160 for g in gaps):
+            return 'triadic', dominant_hue, None
+
+        # Otherwise check for dominant + accents
+        dominant_coverage = dominant['coverage']
+        other_coverage = sum(c['coverage'] for c in hue_clusters[1:])
+        if dominant_coverage > other_coverage * 2:
+            return 'analogous_accent', dominant_hue, hue_clusters[1]['center']
+
+    # Four or more clusters, or complex patterns
+    return 'complex', dominant_hue, None
 
 
 def analyze_gradient_flow(directional: dict, colors: list, coverage: dict,
@@ -1996,6 +2321,27 @@ if __name__ == '__main__':
     # Mark noise in color_metrics
     for b in colors:
         color_metrics[b]['is_noise'] = b in noise_colors
+
+    # Classify color scheme
+    print("\n--- Color Scheme Classification ---")
+    scheme = classify_color_scheme(color_metrics, min_coverage=0.001)
+    print(f"Scheme type: {scheme['scheme_type']}")
+    print(f"Chroma profile: {scheme['chroma_profile']['type']} "
+          f"(median={scheme['chroma_profile']['median']:.1f}, "
+          f"max={scheme['chroma_profile']['max']:.1f})")
+    print(f"Chromatic colors: {len(scheme['chromatic_colors'])}")
+    print(f"Neutral colors: {len(scheme['neutral_colors'])}")
+    print(f"Lightness range: L={scheme['lightness_range'][0]:.0f}-{scheme['lightness_range'][1]:.0f}")
+    if scheme['hue_clusters']:
+        print(f"Hue clusters: {len(scheme['hue_clusters'])}")
+        for i, cluster in enumerate(scheme['hue_clusters']):
+            print(f"  Cluster {i+1}: hue={cluster['center']:.0f}°, "
+                  f"spread={cluster['spread']:.0f}°, "
+                  f"coverage={cluster['coverage']*100:.1f}%")
+    if 'dominant_hue' in scheme:
+        print(f"Dominant hue: {scheme['dominant_hue']:.0f}°")
+    if 'accent_hue' in scheme:
+        print(f"Accent hue: {scheme['accent_hue']:.0f}°")
 
     # Find flow-based gradients with unified scoring
     print("\n--- Directional Flow Method (unified scoring) ---")
