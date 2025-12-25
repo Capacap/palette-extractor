@@ -468,32 +468,54 @@ def detect_color_families(data: PreparedData, stability: dict) -> list:
     return families
 
 
-def build_adjacency_graph(data: PreparedData) -> dict:
-    """Build adjacency graph at fine scale with 8-connectivity."""
-    h, w = data.image_shape
+def build_adjacency_graph(data: PreparedData) -> tuple[dict, dict]:
+    """
+    Build adjacency graph at fine scale with 8-connectivity.
+
+    Returns:
+        adjacency: {(b1, b2): count} - symmetric edge counts
+        directional: {(b1, b2): {'right': n, 'left': n, ...}} - directional counts
+    """
+    # Direction mappings: (dy, dx) -> direction name
+    # Direction is "where b2 is relative to b1"
+    DIRECTIONS = {
+        (-1, -1): 'up_left',    (-1, 0): 'above',    (-1, 1): 'up_right',
+        (0, -1): 'left',                              (0, 1): 'right',
+        (1, -1): 'down_left',   (1, 0): 'below',     (1, 1): 'down_right'
+    }
+    ALL_DIRS = list(DIRECTIONS.values())
+
     adjacency = {}
+    directional = {}
 
     # Rebuild fine binned image for adjacency
-    fine_size = FINE_SCALE * JND
     fine_binned = {}
     for fine_bin, bin_data in data.fine_bins.items():
         for pos in bin_data.positions:
             fine_binned[pos] = fine_bin
 
-    def add_edge(b1, b2):
-        if b1 == b2:
-            return
-        key = (b1, b2) if b1 < b2 else (b2, b1)
-        adjacency[key] = adjacency.get(key, 0) + 1
-
     # Check all 8 neighbors for each pixel
     for (y, x), b1 in fine_binned.items():
-        for dy, dx in [(-1,-1), (-1,0), (-1,1), (0,-1), (0,1), (1,-1), (1,0), (1,1)]:
+        for (dy, dx), dir_name in DIRECTIONS.items():
             ny, nx = y + dy, x + dx
-            if (ny, nx) in fine_binned:
-                add_edge(b1, fine_binned[(ny, nx)])
+            if (ny, nx) not in fine_binned:
+                continue
 
-    return adjacency
+            b2 = fine_binned[(ny, nx)]
+            if b1 == b2:
+                continue
+
+            # Symmetric count
+            sym_key = (b1, b2) if b1 < b2 else (b2, b1)
+            adjacency[sym_key] = adjacency.get(sym_key, 0) + 1
+
+            # Directional count: b2 is in dir_name direction from b1
+            dir_key = (b1, b2)
+            if dir_key not in directional:
+                directional[dir_key] = {d: 0 for d in ALL_DIRS}
+            directional[dir_key][dir_name] += 1
+
+    return adjacency, directional
 
 
 def compute_color_metrics(data: PreparedData, adjacency: dict, stability: dict) -> dict:
@@ -595,245 +617,385 @@ def compute_coherence(data: PreparedData) -> dict:
     return coherence
 
 
-def detect_gradients(data: PreparedData, stability: dict, adjacency: dict, families: list) -> list:
+def compute_fine_coherence(data: PreparedData, coarse_coherence: dict) -> dict:
     """
-    Stage 2c: Detect gradient chains using fine-scale adjacency.
+    Map fine bins to their parent coarse bin's coherence.
 
-    Gradients are sequences of colors with:
-    - Strong adjacency connections
-    - Monotonic progression in LAB
-    - Stops are ANCHOR colors only
+    Computing coherence per fine bin is expensive (O(n) label operations).
+    Instead, use the coarse bin's coherence as a proxy — fine bins inherit
+    their parent's coherence score.
+    """
+    coherence = {}
+    for fine_bin in data.fine_bins:
+        coarse = data.fine_to_coarse.get(fine_bin)
+        if coarse:
+            coherence[fine_bin] = coarse_coherence.get(coarse, 0.0)
+        else:
+            coherence[fine_bin] = 0.0
+    return coherence
+
+
+def analyze_gradient_flow(directional: dict, min_total: int = 50) -> dict:
+    """
+    Analyze directional adjacency to find gradient flow patterns.
+
+    For each color pair, computes:
+    - h_flow: right - left (positive = flows right)
+    - v_flow: below - above (positive = flows down)
+    - Asymmetry: how one-directional the flow is (0-1)
+
+    Args:
+        directional: {(b1, b2): {'right': n, 'left': n, ...}}
+        min_total: minimum total edge count to include pair
+
+    Returns:
+        {(b1, b2): {'h_flow': n, 'v_flow': n, 'h_asymmetry': f, ...}}
+    """
+    flow_analysis = {}
+
+    for (b1, b2), dirs in directional.items():
+        total = sum(dirs.values())
+        if total < min_total:
+            continue
+
+        # Horizontal flow (positive = b2 is right of b1)
+        h_flow = dirs['right'] - dirs['left']
+        # Vertical flow (positive = b2 is below b1)
+        v_flow = dirs['below'] - dirs['above']
+        # Diagonal flows
+        dr_flow = dirs['down_right'] - dirs['up_left']
+        dl_flow = dirs['down_left'] - dirs['up_right']
+
+        # Compute asymmetry (how one-directional)
+        h_total = dirs['right'] + dirs['left']
+        v_total = dirs['below'] + dirs['above']
+        dr_total = dirs['down_right'] + dirs['up_left']
+        dl_total = dirs['down_left'] + dirs['up_right']
+
+        h_asymmetry = abs(h_flow) / (h_total + 1) if h_total > 0 else 0
+        v_asymmetry = abs(v_flow) / (v_total + 1) if v_total > 0 else 0
+        dr_asymmetry = abs(dr_flow) / (dr_total + 1) if dr_total > 0 else 0
+        dl_asymmetry = abs(dl_flow) / (dl_total + 1) if dl_total > 0 else 0
+
+        flow_analysis[(b1, b2)] = {
+            'h_flow': h_flow,
+            'v_flow': v_flow,
+            'dr_flow': dr_flow,
+            'dl_flow': dl_flow,
+            'h_asymmetry': h_asymmetry,
+            'v_asymmetry': v_asymmetry,
+            'dr_asymmetry': dr_asymmetry,
+            'dl_asymmetry': dl_asymmetry,
+            'total': total
+        }
+
+    return flow_analysis
+
+
+def detect_flow_gradients(data: PreparedData, directional: dict,
+                          fine_coherence: dict, families: list,
+                          min_chain_length: int = 3,
+                          min_asymmetry: float = 0.3) -> list:
+    """
+    Detect gradients by following directional flow through the adjacency graph.
+
+    A gradient is a chain where colors consistently flow in one spatial direction:
+    - Horizontal: each color has the next color predominantly to its right (or left)
+    - Vertical: each color has the next color predominantly below (or above)
+    - Diagonal: flows along diagonals
+
+    This approach can capture multi-hue gradients (e.g., red→orange→yellow)
+    as long as they're spatially smooth.
+
+    Args:
+        data: Prepared image data
+        directional: Directional adjacency from build_adjacency_graph
+        fine_coherence: Per-fine-bin coherence scores
+        families: Color families for span detection
+        min_chain_length: Minimum colors to form a gradient
+        min_asymmetry: Minimum flow asymmetry to follow an edge
+
+    Returns:
+        List of GradientChain objects
     """
     fine_size = FINE_SCALE * JND
-    gradients = []
+    colors = list(data.fine_bins.keys())
 
-    # Build fine neighbor graph
-    fine_neighbors = {b: set() for b in data.fine_bins}
-    for (f1, f2), count in adjacency.items():
-        if count >= 10:  # Minimum adjacency threshold
-            fine_neighbors[f1].add(f2)
-            fine_neighbors[f2].add(f1)
+    # Analyze flow patterns
+    # Lower threshold because fine bins have fewer pixels per edge than coarse bins
+    flow = analyze_gradient_flow(directional, min_total=10)
 
-    # Find gradient chains by tracing paths through color space
-    visited_chains = set()
+    # Build directed flow graph
+    # Edge from A to B if B is predominantly in one direction from A
+    ALL_DIRECTIONS = ['right', 'left', 'below', 'above',
+                      'down_right', 'down_left', 'up_right', 'up_left']
+    flow_graph = {b: {d: [] for d in ALL_DIRECTIONS} for b in colors}
 
-    # Start from high-coverage fine bins that map to anchor coarse bins
-    anchor_coarse = {b for b, s in stability.items() if s.stability_type == 'anchor'}
+    def get_coherence(b):
+        return fine_coherence.get(b, 1.0)
 
-    starting_fine = []
-    for fine_bin, bin_data in data.fine_bins.items():
-        coarse = data.fine_to_coarse[fine_bin]
-        if coarse in anchor_coarse and bin_data.count > data.total_pixels * 0.001:
-            starting_fine.append((fine_bin, bin_data.count))
+    for (b1, b2), analysis in flow.items():
+        if b1 not in flow_graph or b2 not in flow_graph:
+            continue
 
-    starting_fine.sort(key=lambda x: -x[1])
+        # Weight by geometric mean of coherences
+        coh1, coh2 = get_coherence(b1), get_coherence(b2)
+        coherence_weight = np.sqrt(coh1 * coh2)
 
-    for start_fine, _ in starting_fine[:MAX_GRADIENT_SEARCH_SEEDS]:
-        # Try to extend gradient in each LAB dimension
-        for axis in [0, 1, 2]:  # L, a, b
-            chain = trace_gradient_chain(start_fine, axis, fine_neighbors, data, fine_size)
+        # Check horizontal flow
+        if analysis['h_asymmetry'] > min_asymmetry:
+            if analysis['h_flow'] > 0:
+                weighted = analysis['h_flow'] * coherence_weight
+                flow_graph[b1]['right'].append((b2, weighted, analysis['total']))
+            else:
+                weighted = -analysis['h_flow'] * coherence_weight
+                flow_graph[b1]['left'].append((b2, weighted, analysis['total']))
 
-            if len(chain) >= 3:
-                # Convert to coarse stops (anchors only)
-                chain_key = tuple(sorted(chain))
-                if chain_key not in visited_chains:
-                    visited_chains.add(chain_key)
+        # Check vertical flow
+        if analysis['v_asymmetry'] > min_asymmetry:
+            if analysis['v_flow'] > 0:
+                weighted = analysis['v_flow'] * coherence_weight
+                flow_graph[b1]['below'].append((b2, weighted, analysis['total']))
+            else:
+                weighted = -analysis['v_flow'] * coherence_weight
+                flow_graph[b1]['above'].append((b2, weighted, analysis['total']))
 
-                    gradient = build_gradient_from_chain(
-                        chain, data, stability, families, fine_size
-                    )
-                    if gradient and len(gradient.stops) >= 2:
-                        gradients.append(gradient)
+        # Check diagonal flows
+        if analysis['dr_asymmetry'] > min_asymmetry:
+            if analysis['dr_flow'] > 0:
+                weighted = analysis['dr_flow'] * coherence_weight
+                flow_graph[b1]['down_right'].append((b2, weighted, analysis['total']))
+            else:
+                weighted = -analysis['dr_flow'] * coherence_weight
+                flow_graph[b1]['up_left'].append((b2, weighted, analysis['total']))
 
-    # Deduplicate and sort by coverage
-    gradients = deduplicate_gradients(gradients)
-    gradients.sort(key=lambda g: -g.coverage)
+        if analysis['dl_asymmetry'] > min_asymmetry:
+            if analysis['dl_flow'] > 0:
+                weighted = analysis['dl_flow'] * coherence_weight
+                flow_graph[b1]['down_left'].append((b2, weighted, analysis['total']))
+            else:
+                weighted = -analysis['dl_flow'] * coherence_weight
+                flow_graph[b1]['up_right'].append((b2, weighted, analysis['total']))
 
-    return gradients[:MAX_NOTABLE_COLORS]
+    # Sort neighbors by coherence-weighted flow strength
+    for b in flow_graph:
+        for direction in flow_graph[b]:
+            flow_graph[b][direction].sort(key=lambda x: x[1], reverse=True)
 
+    def follow_flow(start, direction):
+        """Follow flow in one direction to build a gradient chain."""
+        chain = [start]
+        current = start
+        visited = {start}
 
-def trace_gradient_chain(start: tuple, axis: int, neighbors: dict,
-                         data: PreparedData, fine_size: float) -> list:
-    """Trace a gradient chain along one LAB axis."""
-    chain = [start]
-    visited = {start}
-    current = start
+        while True:
+            candidates = flow_graph[current][direction]
+            next_color = None
+            for neighbor, strength, total in candidates:
+                if neighbor not in visited:
+                    next_color = neighbor
+                    break
 
-    start_lab = np.array(start) * fine_size
+            if next_color is None:
+                break
 
-    # Extend in positive direction
-    while True:
-        current_lab = np.array(current) * fine_size
-        best_next = None
-        best_progress = 0
+            chain.append(next_color)
+            visited.add(next_color)
+            current = next_color
 
-        for neighbor in neighbors.get(current, []):
-            if neighbor in visited:
-                continue
+        return chain
 
-            neighbor_lab = np.array(neighbor) * fine_size
+    # Compute seed scores combining multiple factors
+    total_pixels = data.total_pixels
 
-            # Check monotonic progress along axis
-            progress = neighbor_lab[axis] - current_lab[axis]
-            if progress > fine_size * 0.5:  # Moving in positive direction
-                # Check other axes don't change too much
-                other_change = sum(abs(neighbor_lab[i] - current_lab[i])
-                                   for i in range(3) if i != axis)
-                if other_change < abs(progress) * 2:  # Primarily along main axis
-                    if progress > best_progress:
-                        best_progress = progress
-                        best_next = neighbor
+    # Find LAB extremes for bonus scoring
+    all_labs = {b: np.array(b) * fine_size for b in colors}
+    l_values = {b: lab[0] for b, lab in all_labs.items()}
+    a_values = {b: lab[1] for b, lab in all_labs.items()}
+    b_values = {b: lab[2] for b, lab in all_labs.items()}
 
-        if best_next is None:
-            break
+    l_min_bin = min(l_values, key=l_values.get)
+    l_max_bin = max(l_values, key=l_values.get)
+    a_min_bin = min(a_values, key=a_values.get)
+    a_max_bin = max(a_values, key=a_values.get)
+    b_min_bin = min(b_values, key=b_values.get)
+    b_max_bin = max(b_values, key=b_values.get)
+    extreme_bins = {l_min_bin, l_max_bin, a_min_bin, a_max_bin, b_min_bin, b_max_bin}
 
-        chain.append(best_next)
-        visited.add(best_next)
-        current = best_next
+    # Compute local contrast for each color (avg LAB distance to flow neighbors)
+    local_contrast = {}
+    for b in colors:
+        neighbors = set()
+        for direction in ALL_DIRECTIONS:
+            for neighbor, _, _ in flow_graph[b][direction]:
+                neighbors.add(neighbor)
+        if neighbors:
+            b_lab = all_labs[b]
+            distances = [np.linalg.norm(b_lab - all_labs[n]) for n in neighbors if n in all_labs]
+            local_contrast[b] = np.mean(distances) if distances else 0
+        else:
+            local_contrast[b] = 0
 
-        if len(chain) > MAX_GRADIENT_CHAIN_LENGTH:
-            break
+    # Normalize contrast (typically 0-30 LAB units range)
+    max_contrast = max(local_contrast.values()) if local_contrast else 1
+    contrast_normalized = {b: c / max_contrast for b, c in local_contrast.items()}
 
-    # Extend in negative direction from start
-    current = start
-    prefix = []
+    def compute_seed_score(b):
+        # Coverage: scale so 10% coverage ≈ 1.0
+        cov = data.fine_bins[b].count / total_pixels
+        cov_score = cov * 10
 
-    while True:
-        current_lab = np.array(current) * fine_size
-        best_prev = None
-        best_progress = 0
+        # Contrast boost: up to 0.3 for high contrast colors
+        contrast_score = contrast_normalized.get(b, 0) * 0.3
 
-        for neighbor in neighbors.get(current, []):
-            if neighbor in visited:
-                continue
+        # LAB extreme boost: bonus for colors at extremes
+        extreme_score = 0.2 if b in extreme_bins else 0
 
-            neighbor_lab = np.array(neighbor) * fine_size
+        # Coherence weight: reduce score for scattered/noisy colors
+        coherence = fine_coherence.get(b, 0.5)
 
-            progress = current_lab[axis] - neighbor_lab[axis]
-            if progress > fine_size * 0.5:
-                other_change = sum(abs(neighbor_lab[i] - current_lab[i])
-                                   for i in range(3) if i != axis)
-                if other_change < abs(progress) * 2:
-                    if progress > best_progress:
-                        best_progress = progress
-                        best_prev = neighbor
+        return (cov_score + contrast_score + extreme_score) * coherence
 
-        if best_prev is None:
-            break
+    scored_colors = [(b, compute_seed_score(b)) for b in colors]
+    scored_colors.sort(key=lambda x: x[1], reverse=True)
 
-        prefix.insert(0, best_prev)
-        visited.add(best_prev)
-        current = best_prev
+    all_gradients = []
 
-        if len(prefix) > MAX_GRADIENT_CHAIN_LENGTH:
-            break
+    # Try all directions from top-scored colors
+    for direction in ALL_DIRECTIONS:
+        for start, _ in scored_colors[:MAX_GRADIENT_SEARCH_SEEDS]:
+            chain = follow_flow(start, direction)
 
-    return prefix + chain
+            if len(chain) >= min_chain_length:
+                chain_coverage = sum(data.fine_bins[b].count for b in chain) / total_pixels
 
+                # Compute LAB bounds
+                labs = [np.array(b) * fine_size for b in chain]
+                lab_array = np.array(labs)
+                l_min, l_max = lab_array[:, 0].min(), lab_array[:, 0].max()
+                a_min, a_max = lab_array[:, 1].min(), lab_array[:, 1].max()
+                b_min, b_max = lab_array[:, 2].min(), lab_array[:, 2].max()
 
-def build_gradient_from_chain(chain: list, data: PreparedData, stability: dict,
-                               families: list, fine_size: float) -> Optional[GradientChain]:
-    """Build a GradientChain from a list of fine bins."""
-    if len(chain) < 3:
-        return None
+                all_gradients.append({
+                    'chain': chain,
+                    'direction': direction,
+                    'coverage': chain_coverage,
+                    'l_range': l_max - l_min,
+                    'a_range': a_max - a_min,
+                    'b_range': b_max - b_min,
+                    'l_bounds': (l_min, l_max),
+                    'a_bounds': (a_min, a_max),
+                    'b_bounds': (b_min, b_max),
+                    'score': len(chain) * chain_coverage
+                })
 
-    # Map to coarse bins and filter to anchors
-    coarse_chain = []
-    seen_coarse = set()
+    # Sort by score
+    all_gradients.sort(key=lambda x: x['score'], reverse=True)
 
-    for fine_bin in chain:
-        coarse = data.fine_to_coarse[fine_bin]
-        if coarse not in seen_coarse:
-            stab = stability.get(coarse)
-            if stab and stab.stability_type == 'anchor':
-                coarse_chain.append(coarse)
+    # Deduplicate by LAB bounds overlap
+    def bounds_overlap(bounds1, bounds2):
+        """Compute overlap ratio: how much of bounds1 is inside bounds2."""
+        min1, max1 = bounds1
+        min2, max2 = bounds2
+        range1 = max1 - min1
+        if range1 < 0.1:
+            return 1.0 if min2 <= min1 <= max2 else 0.0
+        overlap_min = max(min1, min2)
+        overlap_max = min(max1, max2)
+        overlap = max(0, overlap_max - overlap_min)
+        return overlap / range1
+
+    final_gradients = []
+    for grad in all_gradients:
+        is_redundant = False
+        for existing in final_gradients:
+            l_overlap = bounds_overlap(grad['l_bounds'], existing['l_bounds'])
+            a_overlap = bounds_overlap(grad['a_bounds'], existing['a_bounds'])
+            b_overlap = bounds_overlap(grad['b_bounds'], existing['b_bounds'])
+            if l_overlap >= 0.5 and a_overlap >= 0.5 and b_overlap >= 0.5:
+                is_redundant = True
+                break
+        if not is_redundant:
+            final_gradients.append(grad)
+
+    # Convert to GradientChain objects
+    result = []
+    for grad in final_gradients[:MAX_NOTABLE_COLORS]:
+        # Map spatial direction to display direction
+        dir_name = grad['direction']
+        if dir_name in ('right', 'left'):
+            display_dir = 'horizontal'
+        elif dir_name in ('below', 'above'):
+            display_dir = 'vertical'
+        elif dir_name in ('down_right', 'up_left'):
+            display_dir = 'diagonal'
+        else:
+            display_dir = 'anti-diagonal'
+
+        # Map fine bins to coarse bins for stops
+        coarse_stops = []
+        seen_coarse = set()
+        for fine_bin in grad['chain']:
+            coarse = data.fine_to_coarse.get(fine_bin)
+            if coarse and coarse not in seen_coarse:
+                coarse_stops.append(coarse)
                 seen_coarse.add(coarse)
 
-    if len(coarse_chain) < 2:
-        return None
+        if len(coarse_stops) < 2:
+            continue
 
-    # Compute coverage
-    coverage = sum(data.fine_bins[fb].count for fb in chain) / data.total_pixels
+        # Filter out low-variation gradients (look like solid blocks)
+        l_span = grad['l_bounds'][1] - grad['l_bounds'][0]
+        a_span = grad['a_bounds'][1] - grad['a_bounds'][0]
+        b_span = grad['b_bounds'][1] - grad['b_bounds'][0]
+        total_span = l_span + a_span + b_span
+        if total_span < 40:  # ~17 JND minimum variation
+            continue
 
-    # Compute LAB range
-    fine_labs = [np.array(fb) * fine_size for fb in chain]
-    L_vals = [lab[0] for lab in fine_labs]
-    a_vals = [lab[1] for lab in fine_labs]
-    b_vals = [lab[2] for lab in fine_labs]
+        # Determine which color families this gradient spans
+        family_indices = set()
+        for stop in coarse_stops:
+            lab = data.coarse_bins[stop].lab
+            hue = compute_hue(lab)
+            chroma = compute_chroma(lab)
+            # Skip neutral colors (low chroma)
+            if chroma < 8:
+                continue
+            for i, family in enumerate(families):
+                if family.is_neutral:
+                    continue
+                if circular_hue_distance(hue, family.hue_center) <= HUE_CLUSTER_RANGE:
+                    family_indices.add(i)
+                    break
 
-    lab_range = {
-        'L': (min(L_vals), max(L_vals)),
-        'a': (min(a_vals), max(a_vals)),
-        'b': (min(b_vals), max(b_vals))
-    }
+        result.append(GradientChain(
+            stops=coarse_stops,
+            fine_members=grad['chain'],
+            direction=display_dir,
+            coverage=grad['coverage'],
+            lab_range={
+                'L': grad['l_bounds'],
+                'a': grad['a_bounds'],
+                'b': grad['b_bounds']
+            },
+            family_span=list(family_indices)
+        ))
 
-    # Determine direction based on dominant change
-    L_range = lab_range['L'][1] - lab_range['L'][0]
-    a_range = lab_range['a'][1] - lab_range['a'][0]
-    b_range = lab_range['b'][1] - lab_range['b'][0]
-
-    if L_range > max(a_range, b_range):
-        direction = 'lightness'
-    elif a_range > b_range:
-        direction = 'green-red'
-    else:
-        direction = 'blue-yellow'
-
-    # Find which families this spans
-    family_span = []
-    for family in families:
-        for stop in coarse_chain:
-            if stop in family.members:
-                if family not in family_span:
-                    family_span.append(family)
-                break
-
-    return GradientChain(
-        stops=coarse_chain,
-        fine_members=chain,
-        direction=direction,
-        coverage=coverage,
-        lab_range=lab_range,
-        family_span=[f.hue_center if not f.is_neutral else 'neutral' for f in family_span]
-    )
-
-
-def deduplicate_gradients(gradients: list) -> list:
-    """Remove duplicate/overlapping gradients."""
-    if not gradients:
-        return []
-
-    # Sort by coverage descending
-    gradients.sort(key=lambda g: -g.coverage)
-
-    kept = []
-    for grad in gradients:
-        stops_set = set(grad.stops)
-
-        # Check overlap with already kept gradients
-        is_duplicate = False
-        for kept_grad in kept:
-            kept_stops = set(kept_grad.stops)
-            overlap = len(stops_set & kept_stops)
-            min_len = min(len(stops_set), len(kept_stops))
-
-            if overlap >= min_len * 0.7:  # 70% overlap = duplicate
-                is_duplicate = True
-                break
-
-        if not is_duplicate:
-            kept.append(grad)
-
-    return kept
+    return result
 
 
 def extract_features(data: PreparedData) -> FeatureData:
     """Stage 2: Extract all features from prepared data."""
     stability = analyze_scale_stability(data)
     families = detect_color_families(data, stability)
-    adjacency = build_adjacency_graph(data)
+    adjacency, directional = build_adjacency_graph(data)
     metrics = compute_color_metrics(data, adjacency, stability)
-    gradients = detect_gradients(data, stability, adjacency, families)
+
+    # Extract coarse coherence from metrics, then map to fine bins
+    coarse_coherence = {b: m.coherence for b, m in metrics.items()}
+    fine_coherence = compute_fine_coherence(data, coarse_coherence)
+
+    gradients = detect_flow_gradients(data, directional, fine_coherence, families)
 
     return FeatureData(
         stability=stability,
@@ -1561,24 +1723,42 @@ def render_html(synthesis: SynthesisResult, features: FeatureData, image_path: s
     # Gradients
     if synthesis.gradients:
         lines.append('<h2>Gradients</h2>')
+        fine_size = FINE_SCALE * JND
+
         for grad in synthesis.gradients:
-            # Build gradient CSS
-            stops_css = []
+            # Subsample fine_members for cleaner CSS gradient (max ~20 stops)
+            max_css_stops = 20
+            fine_members = grad.fine_members
+            if len(fine_members) > max_css_stops:
+                # Evenly sample across the chain
+                indices = [int(i * (len(fine_members) - 1) / (max_css_stops - 1))
+                          for i in range(max_css_stops)]
+                fine_members = [fine_members[i] for i in indices]
+
+            # Build CSS gradient from subsampled fine_members
+            fine_stops_css = []
+            for i, fine_bin in enumerate(fine_members):
+                lab = np.array(fine_bin) * fine_size
+                hex_val = lab_to_hex(lab)
+                pct = (i / max(1, len(fine_members) - 1)) * 100
+                fine_stops_css.append(f"{hex_val} {pct:.0f}%")
+
+            # Build labeled stops from coarse bins (representative colors)
             stop_info = []
-            for i, stop in enumerate(grad.stops):
+            for stop in grad.stops:
                 metrics = features.metrics.get(stop)
                 if metrics:
                     hex_val = lab_to_hex(metrics.lab)
                     name = generate_color_name(metrics.lab)
-                    pct = (i / max(1, len(grad.stops) - 1)) * 100
-                    stops_css.append(f"{hex_val} {pct:.0f}%")
                     stop_info.append((hex_val, name, metrics.lab))
 
             # Skip if no valid stops found
-            if not stop_info:
+            if not fine_stops_css:
                 continue
 
-            gradient_css = f"linear-gradient(to right, {', '.join(stops_css)})"
+            # Always render horizontally for easier visual comparison
+            # (actual spatial direction shown in metadata below)
+            gradient_css = f"linear-gradient(to right, {', '.join(fine_stops_css)})"
 
             lines.append('<div class="gradient-block">')
             lines.append(f'  <div class="gradient-bar" style="background:{gradient_css}"></div>')
