@@ -22,6 +22,17 @@ JND = 2.3  # Just Noticeable Difference in LAB units
 FINE_SCALE = 1.0  # Fine bins: 1 JND = 2.3 LAB units
 COARSE_SCALE = 5.0  # Coarse bins: ~12 LAB units
 
+# Image size limits (security: prevent decompression bombs)
+MAX_IMAGE_PIXELS = 50_000_000  # 50 megapixels
+MAX_IMAGE_DIMENSION = 10_000  # 10k pixels per side
+
+# Algorithm parameters
+HUE_CLUSTER_RANGE = 30  # Degrees within which hues are considered similar
+MAX_GRADIENT_SEARCH_SEEDS = 50  # Limit gradient detection search
+MAX_GRADIENT_CHAIN_LENGTH = 20  # Maximum colors in a gradient chain
+MIN_SIGNIFICANCE_RATIO = 0.05  # Minimum significance relative to top color
+MAX_NOTABLE_COLORS = 10  # Maximum colors to include in output
+
 
 # =============================================================================
 # Color Conversion
@@ -107,6 +118,26 @@ def lab_to_rgb_tuple(lab: np.ndarray) -> tuple:
 
 
 # =============================================================================
+# Color Utilities
+# =============================================================================
+
+def compute_chroma(lab: np.ndarray) -> float:
+    """Compute chroma (saturation) from LAB coordinates."""
+    return math.sqrt(lab[1]**2 + lab[2]**2)
+
+
+def compute_hue(lab: np.ndarray) -> float:
+    """Compute hue angle (0-360 degrees) from LAB coordinates."""
+    return math.degrees(math.atan2(lab[2], lab[1])) % 360
+
+
+def circular_hue_distance(hue1: float, hue2: float) -> float:
+    """Compute minimum angular distance between two hues (0-180)."""
+    diff = abs(hue1 - hue2)
+    return min(diff, 360 - diff)
+
+
+# =============================================================================
 # Stage 1: Data Preparation
 # =============================================================================
 
@@ -135,9 +166,32 @@ def prepare_data(image_path: str) -> PreparedData:
 
     Fine scale (JND): preserves gradient steps
     Coarse scale (~5x JND): captures major color blocks
+
+    Raises:
+        FileNotFoundError: If image file doesn't exist
+        ValueError: If file is not a valid image or exceeds size limits
     """
-    # Load image
-    img = Image.open(image_path).convert('RGB')
+    # Load image with validation
+    try:
+        img = Image.open(image_path)
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    except Exception as e:
+        raise ValueError(f"Could not open image: {e}")
+
+    # Validate image dimensions (security: prevent decompression bombs)
+    width, height = img.size
+    if width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION:
+        raise ValueError(
+            f"Image dimensions {width}x{height} exceed maximum "
+            f"{MAX_IMAGE_DIMENSION}x{MAX_IMAGE_DIMENSION}"
+        )
+    if width * height > MAX_IMAGE_PIXELS:
+        raise ValueError(
+            f"Image has {width * height:,} pixels, exceeding maximum {MAX_IMAGE_PIXELS:,}"
+        )
+
+    img = img.convert('RGB')
     pixels = np.array(img)
     h, w = pixels.shape[:2]
 
@@ -332,8 +386,8 @@ def detect_color_families(data: PreparedData, stability: dict) -> list:
     bin_info = {}
     for coarse_bin, bin_data in data.coarse_bins.items():
         lab = bin_data.lab
-        chroma = math.sqrt(lab[1]**2 + lab[2]**2)
-        hue = math.degrees(math.atan2(lab[2], lab[1])) % 360
+        chroma = compute_chroma(lab)
+        hue = compute_hue(lab)
         coverage = bin_data.count / data.total_pixels
         bin_info[coarse_bin] = {
             'lab': lab,
@@ -345,15 +399,12 @@ def detect_color_families(data: PreparedData, stability: dict) -> list:
 
     # Adaptive chroma threshold based on distribution
     chromas = [info['chroma'] for info in bin_info.values()]
-    median_chroma = np.median(chromas)
+    median_chroma = np.median(chromas) if chromas else 0
     chroma_threshold = max(10, median_chroma * 0.5)
 
     # Separate chromatic and neutral
     chromatic_bins = {b: info for b, info in bin_info.items() if info['chroma'] >= chroma_threshold}
     neutral_bins = {b: info for b, info in bin_info.items() if info['chroma'] < chroma_threshold}
-
-    # Cluster chromatic bins by hue (within 30 degrees)
-    HUE_CLUSTER_RANGE = 30
 
     # Sort by coverage to seed clusters with most significant colors
     sorted_chromatic = sorted(chromatic_bins.items(), key=lambda x: -x[1]['coverage'])
@@ -370,9 +421,7 @@ def detect_color_families(data: PreparedData, stability: dict) -> list:
             if other_bin in assigned:
                 continue
 
-            # Circular hue distance
-            hue_diff = abs(seed_info['hue'] - other_info['hue'])
-            hue_diff = min(hue_diff, 360 - hue_diff)
+            hue_diff = circular_hue_distance(seed_info['hue'], other_info['hue'])
 
             if hue_diff <= HUE_CLUSTER_RANGE:
                 cluster_members.append(other_bin)
@@ -490,8 +539,8 @@ def compute_color_metrics(data: PreparedData, adjacency: dict, stability: dict) 
 
     for coarse_bin, bin_data in data.coarse_bins.items():
         lab = bin_data.lab
-        chroma = math.sqrt(lab[1]**2 + lab[2]**2)
-        hue = math.degrees(math.atan2(lab[2], lab[1])) % 360
+        chroma = compute_chroma(lab)
+        hue = compute_hue(lab)
         coverage = bin_data.count / data.total_pixels
 
         neighbor_count = len(coarse_neighbors[coarse_bin])
@@ -579,7 +628,7 @@ def detect_gradients(data: PreparedData, stability: dict, adjacency: dict, famil
 
     starting_fine.sort(key=lambda x: -x[1])
 
-    for start_fine, _ in starting_fine[:50]:  # Limit search
+    for start_fine, _ in starting_fine[:MAX_GRADIENT_SEARCH_SEEDS]:
         # Try to extend gradient in each LAB dimension
         for axis in [0, 1, 2]:  # L, a, b
             chain = trace_gradient_chain(start_fine, axis, fine_neighbors, data, fine_size)
@@ -600,7 +649,7 @@ def detect_gradients(data: PreparedData, stability: dict, adjacency: dict, famil
     gradients = deduplicate_gradients(gradients)
     gradients.sort(key=lambda g: -g.coverage)
 
-    return gradients[:10]  # Return top 10
+    return gradients[:MAX_NOTABLE_COLORS]
 
 
 def trace_gradient_chain(start: tuple, axis: int, neighbors: dict,
@@ -642,7 +691,7 @@ def trace_gradient_chain(start: tuple, axis: int, neighbors: dict,
         visited.add(best_next)
         current = best_next
 
-        if len(chain) > 20:  # Limit chain length
+        if len(chain) > MAX_GRADIENT_CHAIN_LENGTH:
             break
 
     # Extend in negative direction from start
@@ -676,7 +725,7 @@ def trace_gradient_chain(start: tuple, axis: int, neighbors: dict,
         visited.add(best_prev)
         current = best_prev
 
-        if len(prefix) > 20:
+        if len(prefix) > MAX_GRADIENT_CHAIN_LENGTH:
             break
 
     return prefix + chain
@@ -882,9 +931,9 @@ def compute_significance(metrics: ColorMetrics, stability: StabilityInfo,
 
 def generate_color_name(lab: np.ndarray) -> str:
     """Generate a descriptive name from LAB coordinates."""
-    L, a, b = lab[0], lab[1], lab[2]
-    chroma = math.sqrt(a**2 + b**2)
-    hue = math.degrees(math.atan2(b, a)) % 360
+    L = lab[0]
+    chroma = compute_chroma(lab)
+    hue = compute_hue(lab)
 
     # Neutral colors
     if chroma < 8:
@@ -1076,8 +1125,7 @@ def determine_scheme_type(families: list, notable_colors: list) -> tuple:
     hues = [f.hue_center for f in chromatic_families]
 
     if len(hues) == 2:
-        hue_diff = abs(hues[0] - hues[1])
-        hue_diff = min(hue_diff, 360 - hue_diff)
+        hue_diff = circular_hue_distance(hues[0], hues[1])
 
         if hue_diff < 60:
             return "analogous", f"Adjacent hues ({hues[0]:.0f}° and {hues[1]:.0f}°)"
@@ -1097,8 +1145,7 @@ def determine_scheme_type(families: list, notable_colors: list) -> tuple:
     # Check for analogous with accent
     if len(chromatic_families) >= 2:
         main_hues = sorted(hues)[:2]
-        main_diff = abs(main_hues[0] - main_hues[1])
-        main_diff = min(main_diff, 360 - main_diff)
+        main_diff = circular_hue_distance(main_hues[0], main_hues[1])
 
         if main_diff < 60 and accents:
             return "analogous_accent", "Analogous base with contrasting accent"
@@ -1125,10 +1172,10 @@ def synthesize(data: PreparedData, features: FeatureData) -> SynthesisResult:
     # Select notable colors (top by significance, minimum threshold)
     sorted_bins = sorted(significance_scores.items(), key=lambda x: -x[1])
 
-    # Threshold: at least 1% coverage worth of significance, or top 10% of max
-    notable_threshold = max(1, sorted_bins[0][1] * 0.05) if sorted_bins else 1
+    # Threshold: minimum significance relative to top color
+    notable_threshold = max(1, sorted_bins[0][1] * MIN_SIGNIFICANCE_RATIO) if sorted_bins else 1
 
-    notable_bins = [(b, s) for b, s in sorted_bins if s >= notable_threshold][:10]
+    notable_bins = [(b, s) for b, s in sorted_bins if s >= notable_threshold][:MAX_NOTABLE_COLORS]
 
     # Identify accents: high chroma + low coverage + high isolation
     # Must have at least some coverage to be notable (>0.1%)
@@ -1199,12 +1246,11 @@ def synthesize(data: PreparedData, features: FeatureData) -> SynthesisResult:
             if c1.name == c2.name:
                 continue
 
-            hue1 = math.degrees(math.atan2(c1.lab[2], c1.lab[1])) % 360
-            hue2 = math.degrees(math.atan2(c2.lab[2], c2.lab[1])) % 360
-            hue_diff = abs(hue1 - hue2)
-            hue_diff = min(hue_diff, 360 - hue_diff)
+            hue1 = compute_hue(c1.lab)
+            hue2 = compute_hue(c2.lab)
+            hue_diff = circular_hue_distance(hue1, hue2)
 
-            if hue_diff < 30:
+            if hue_diff < HUE_CLUSTER_RANGE:
                 # Deduplicate by name pair
                 pair_key = tuple(sorted([c1.name, c2.name]))
                 if pair_key not in seen_pairs:
