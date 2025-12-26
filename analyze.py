@@ -32,6 +32,7 @@ MAX_GRADIENT_SEARCH_SEEDS = 50  # Limit gradient detection search
 MAX_GRADIENT_CHAIN_LENGTH = 20  # Maximum colors in a gradient chain
 MIN_SIGNIFICANCE_RATIO = 0.05  # Minimum significance relative to top color
 MAX_NOTABLE_COLORS = 10  # Maximum colors to include in output
+GRADIENT_ANGLE_THRESHOLD = 74  # Degrees; reject gradients with mean local angle above this
 
 # XKCD color survey data (949 colors)
 # Source: https://xkcd.com/color/rgb/ (CC0 1.0 Public Domain)
@@ -1666,6 +1667,51 @@ def analyze_gradient_flow(directional: dict, min_total: int = 50) -> dict:
     return flow_analysis
 
 
+def compute_local_angles(fine_members: list) -> list:
+    """
+    Compute local angle at each interior point in the gradient chain.
+
+    At each point (except endpoints), compute the angle between:
+    - Incoming direction (from previous point)
+    - Outgoing direction (to next point)
+
+    Returns list of angles in degrees. Empty list if chain too short.
+    """
+    if len(fine_members) < 3:
+        return []
+
+    fine_size = FINE_SCALE * JND
+
+    # Convert fine bins to LAB coordinates
+    labs = [np.array(fb) * fine_size for fb in fine_members]
+
+    angles = []
+    for i in range(1, len(labs) - 1):
+        # Incoming vector: from previous to current
+        v_in = labs[i] - labs[i-1]
+        # Outgoing vector: from current to next
+        v_out = labs[i+1] - labs[i]
+
+        # Compute angle between vectors
+        norm_in = np.linalg.norm(v_in)
+        norm_out = np.linalg.norm(v_out)
+
+        if norm_in < 1e-6 or norm_out < 1e-6:
+            # Zero-length vector (duplicate point), skip — can't determine direction
+            continue
+
+        # Cosine of angle
+        cos_angle = np.dot(v_in, v_out) / (norm_in * norm_out)
+        # Clamp to [-1, 1] to handle numerical issues
+        cos_angle = np.clip(cos_angle, -1.0, 1.0)
+
+        # Convert to degrees
+        angle_deg = np.degrees(np.arccos(cos_angle))
+        angles.append(angle_deg)
+
+    return angles
+
+
 def detect_flow_gradients(data: PreparedData, directional: dict,
                           fine_coherence: dict, families: list,
                           min_chain_length: int = 3,
@@ -1924,6 +1970,13 @@ def detect_flow_gradients(data: PreparedData, directional: dict,
         b_span = grad['b_bounds'][1] - grad['b_bounds'][0]
         total_span = l_span + a_span + b_span
         if total_span < 40:  # ~17 JND minimum variation
+            continue
+
+        # Filter out directionally incoherent gradients (noisy zig-zags)
+        # High mean angle indicates random direction changes rather than smooth
+        # progression through LAB space (90° = orthogonal = random walk)
+        angles = compute_local_angles(grad['chain'])
+        if angles and np.mean(angles) >= GRADIENT_ANGLE_THRESHOLD:
             continue
 
         # Determine which color families this gradient spans
