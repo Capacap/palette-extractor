@@ -989,18 +989,22 @@ XKCD_COLORS = (
 )
 
 # Cache for XKCD colors in LAB space (computed on first use)
-_xkcd_lab_cache: Optional[list] = None
+# Stores (names_list, lab_array) for vectorized lookup
+_xkcd_lab_cache: Optional[tuple[list[str], np.ndarray]] = None
 
 
-def _get_xkcd_lab_colors() -> list:
+def _get_xkcd_lab_colors() -> tuple[list[str], np.ndarray]:
     """Get XKCD colors converted to LAB space. Cached after first call."""
     global _xkcd_lab_cache
     if _xkcd_lab_cache is None:
-        _xkcd_lab_cache = []
+        names = []
+        labs = []
         for name, r, g, b in XKCD_COLORS:
             rgb = np.array([[r, g, b]])
             lab = rgb_to_lab(rgb)[0]
-            _xkcd_lab_cache.append((name, lab))
+            names.append(name)
+            labs.append(lab)
+        _xkcd_lab_cache = (names, np.array(labs))
     return _xkcd_lab_cache
 
 
@@ -2063,19 +2067,10 @@ def compute_significance(metrics: ColorMetrics, stability: StabilityInfo,
 
 def generate_color_name(lab: np.ndarray) -> str:
     """Find the nearest XKCD color name for a LAB coordinate."""
-    xkcd_colors = _get_xkcd_lab_colors()
-
-    best_name = "Unknown"
-    best_dist = float('inf')
-
-    for name, xkcd_lab in xkcd_colors:
-        # Euclidean distance in LAB space
-        dist = np.sqrt(np.sum((lab - xkcd_lab) ** 2))
-        if dist < best_dist:
-            best_dist = dist
-            best_name = name
-
-    return best_name
+    names, labs = _get_xkcd_lab_colors()
+    # Squared Euclidean distance (sqrt unnecessary for argmin)
+    distances = np.sum((labs - lab) ** 2, axis=1)
+    return names[np.argmin(distances)]
 
 
 def classify_role(metrics: ColorMetrics, all_metrics: dict, is_accent: bool) -> str:
