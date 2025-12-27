@@ -3,6 +3,7 @@
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 from analyze import run_pipeline, render_html
@@ -32,6 +33,11 @@ def main():
         required=True,
         help='Directory for HTML output files'
     )
+    parser.add_argument(
+        '--no-downscale',
+        action='store_true',
+        help='Process at full resolution instead of downscaling to 256px'
+    )
 
     args = parser.parse_args()
 
@@ -55,18 +61,23 @@ def main():
     total = len(images)
     succeeded = 0
     failed = []
+    downscale = not args.no_downscale
+
+    batch_start = time.perf_counter()
 
     for i, image_path in enumerate(images, 1):
         try:
-            synthesis, features = run_pipeline(str(image_path))
+            img_start = time.perf_counter()
+            synthesis, features = run_pipeline(str(image_path), downscale=downscale)
             html = render_html(synthesis, features, str(image_path))
+            img_elapsed = time.perf_counter() - img_start
 
             output_file = output_dir / f"{image_path.stem}-palette.html"
             if output_file.exists():
                 print(f"  Warning: Overwriting {output_file.name}", file=sys.stderr)
             output_file.write_text(html)
 
-            print(f"[{i}/{total}] {image_path.name} → {synthesis.scheme_type}")
+            print(f"[{i}/{total}] {image_path.name} → {synthesis.scheme_type} ({img_elapsed:.2f}s)")
             succeeded += 1
 
         except Exception as e:
@@ -74,9 +85,13 @@ def main():
             print(f"[{i}/{total}] {image_path.name} → ERROR: {error_msg}", file=sys.stderr)
             failed.append((image_path.name, error_msg))
 
+    batch_elapsed = time.perf_counter() - batch_start
+
     # Summary
     print()
-    print(f"Completed: {succeeded}/{total} succeeded")
+    print(f"Completed: {succeeded}/{total} succeeded in {batch_elapsed:.2f}s")
+    if succeeded > 0:
+        print(f"Average: {batch_elapsed / succeeded:.2f}s per image")
     if failed:
         print(f"Failed ({len(failed)}):")
         for name, error in failed:

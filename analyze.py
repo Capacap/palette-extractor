@@ -1172,12 +1172,16 @@ class PreparedData:
     coarse_binned: np.ndarray  # (h, w, 3) array of coarse bin indices
 
 
-def prepare_data(image_path: str) -> PreparedData:
+def prepare_data(image_path: str, downscale: bool = True) -> PreparedData:
     """
     Stage 1: Load image and quantize at two scales.
 
     Fine scale (JND): preserves gradient steps
     Coarse scale (~5x JND): captures major color blocks
+
+    Args:
+        image_path: Path to the image file
+        downscale: If True, resize images so longest edge is 256px (default: True)
 
     Raises:
         FileNotFoundError: If image file doesn't exist
@@ -1204,6 +1208,13 @@ def prepare_data(image_path: str) -> PreparedData:
         raise ValueError(
             f"Image has {width * height:,} pixels, exceeding maximum {MAX_IMAGE_PIXELS:,}"
         )
+
+    # Downscale if enabled and image exceeds 256px on longest edge
+    if downscale and max(width, height) > 256:
+        scale = 256 / max(width, height)
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
     img = img.convert('RGB')
     pixels = np.array(img)
@@ -2962,14 +2973,18 @@ def render_html(synthesis: SynthesisResult, features: FeatureData, image_path: s
 # Main Pipeline
 # =============================================================================
 
-def run_pipeline(image_path: str) -> tuple[SynthesisResult, FeatureData]:
+def run_pipeline(image_path: str, downscale: bool = True) -> tuple[SynthesisResult, FeatureData]:
     """Run analysis pipeline stages 1-3.
+
+    Args:
+        image_path: Path to the image file
+        downscale: If True, resize images so longest edge is 256px (default: True)
 
     Returns:
         Tuple of (synthesis_result, feature_data) for rendering.
     """
     # Stage 1: Data Preparation
-    data = prepare_data(image_path)
+    data = prepare_data(image_path, downscale=downscale)
 
     # Stage 2: Feature Extraction
     features = extract_features(data)
@@ -2980,13 +2995,17 @@ def run_pipeline(image_path: str) -> tuple[SynthesisResult, FeatureData]:
     return synthesis, features
 
 
-def analyze_image(image_path: str) -> tuple[str, str]:
+def analyze_image(image_path: str, downscale: bool = True) -> tuple[str, str]:
     """Run the full analysis pipeline on an image.
+
+    Args:
+        image_path: Path to the image file
+        downscale: If True, resize images so longest edge is 256px (default: True)
 
     Returns:
         Tuple of (prose_output, html_output)
     """
-    synthesis, features = run_pipeline(image_path)
+    synthesis, features = run_pipeline(image_path, downscale=downscale)
     prose = render(synthesis, features)
     html = render_html(synthesis, features, image_path)
     return prose, html
@@ -3016,13 +3035,18 @@ if __name__ == '__main__':
         default=None,
         help='Write HTML report. Optionally specify path, otherwise auto-names from input.'
     )
+    parser.add_argument(
+        '--no-downscale',
+        action='store_true',
+        help='Process at full resolution instead of downscaling to 256px'
+    )
 
     args = parser.parse_args()
     image_path = Path(args.input)
 
     # Run analysis
     try:
-        prose, html = analyze_image(str(image_path))
+        prose, html = analyze_image(str(image_path), downscale=not args.no_downscale)
     except KeyboardInterrupt:
         sys.exit(130)
     except FileNotFoundError as e:
