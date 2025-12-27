@@ -2429,15 +2429,23 @@ def render(synthesis: SynthesisResult, features: FeatureData) -> str:
     lines = []
 
     # Header
-    lines.append(f"SCHEME: {synthesis.scheme_type}")
-    lines.append(synthesis.scheme_description)
+    lines.append("OVERVIEW:")
+    lines.append("Palette classification based on hue distribution, contrast range, and color")
+    lines.append("relationships. Lightness (L) and chroma (saturation) ranges show tonal spread.")
+    lines.append("")
+    lines.append(f"Scheme: {synthesis.scheme_type}")
+    lines.append(f"  {synthesis.scheme_description}")
     lines.append(f"Lightness range: {synthesis.lightness_range[0]:.0f}-{synthesis.lightness_range[1]:.0f} | "
                  f"Chroma range: {synthesis.chroma_range[0]:.0f}-{synthesis.chroma_range[1]:.0f}")
     lines.append(f"Notable colors: {len(synthesis.notable_colors)}")
+    lines.append(f"Distribution: {synthesis.distribution_analysis}")
     lines.append("")
 
     # Colors section
     lines.append("COLORS:")
+    lines.append("Colors ranked by visual prominence. Roles: Dominant = highest coverage,")
+    lines.append("Secondary = next most prominent, Accent = high contrast or saturation with")
+    lines.append("lower coverage, Dark/Light = value extremes for text and backgrounds.")
     lines.append("")
 
     for color in synthesis.notable_colors:
@@ -2455,6 +2463,9 @@ def render(synthesis: SynthesisResult, features: FeatureData) -> str:
     # Gradients section
     if synthesis.gradients:
         lines.append("GRADIENTS:")
+        lines.append("Smooth color transitions detected in the image. Gradients indicate areas")
+        lines.append("where colors blend spatially — useful for backgrounds or lighting effects.")
+        lines.append("Direction shows transition axis; span measures lightness range across stops.")
         lines.append("")
 
         for i, grad in enumerate(synthesis.gradients):
@@ -2487,23 +2498,23 @@ def render(synthesis: SynthesisResult, features: FeatureData) -> str:
 
     # Relationships section
     lines.append("RELATIONSHIPS:")
+    lines.append("How colors interact. Contrast pairs have high visual separation — rated by")
+    lines.append("WCAG accessibility (AAA ≥7:1, AA ≥4.5:1, AA-large ≥3:1). Harmonic pairs share")
+    lines.append("similar hue and naturally complement each other.")
     lines.append("")
 
     if synthesis.contrast_pairs:
-        lines.append("Contrast pairs (figural - good for emphasis):")
+        lines.append("Contrast pairs (high separation — good for text/emphasis):")
         for pair in synthesis.contrast_pairs:
             lines.append(f"  - {pair.color_a} / {pair.color_b}: "
                         f"Ratio {pair.contrast_ratio:.1f}:1 (WCAG {pair.wcag_level}) | ΔL={pair.delta_l:.0f}")
         lines.append("")
 
     if synthesis.harmonic_pairs:
-        lines.append("Harmonic pairs (cohesive - good for backgrounds):")
+        lines.append("Harmonic pairs (similar hue — good for cohesive backgrounds):")
         for pair in synthesis.harmonic_pairs:
             lines.append(f"  - {pair.color_a} and {pair.color_b}: "
                         f"Similar hue ({pair.hue_difference:.0f}° apart)")
-        lines.append("")
-
-    lines.append(f"Distribution: {synthesis.distribution_analysis}")
 
     return "\n".join(lines)
 
@@ -2519,8 +2530,9 @@ def render_html(synthesis: SynthesisResult, features: FeatureData, image_path: s
 
     safe_path = escape(image_path)
 
-    # Build name-to-hex lookup once for contrast/harmonic pairs
+    # Build name lookups once for contrast/harmonic pairs
     name_to_hex = {c.name: c.hex for c in synthesis.notable_colors}
+    name_to_L = {c.name: c.lab[0] for c in synthesis.notable_colors}
 
     # CSS styles
     css = """
@@ -2635,18 +2647,36 @@ def render_html(synthesis: SynthesisResult, features: FeatureData, image_path: s
         .badge-aa-large { background: #f59e0b; color: #fff; }
         .badge-fail { background: #ef4444; color: #fff; }
         .harmonic-pair {
+            background: #fff;
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 0.75rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        }
+        .harmonic-swatches {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 0.75rem;
+        }
+        .harmonic-swatches .swatch {
+            flex: 1;
+            height: 48px;
+            border-radius: 6px;
             display: flex;
             align-items: center;
-            gap: 0.5rem;
-            margin-bottom: 0.5rem;
-            font-size: 0.9rem;
+            justify-content: center;
+            font-size: 0.75rem;
+            font-weight: 500;
         }
-        .harmonic-pair .swatch {
-            width: 20px;
-            height: 20px;
-            border-radius: 4px;
+        .harmonic-info {
+            font-size: 0.85rem;
+            color: #666;
         }
-        .distribution { font-size: 0.9rem; color: #555; margin-top: 1rem; }
+        .harmonic-info .names {
+            color: #333;
+            font-weight: 500;
+        }
+        .section-intro { font-size: 0.9rem; color: #666; margin-bottom: 1rem; line-height: 1.6; }
     """
 
     # Build HTML
@@ -2663,12 +2693,16 @@ def render_html(synthesis: SynthesisResult, features: FeatureData, image_path: s
     ]
 
     # Header
+    lines.append('<h2>Overview</h2>')
+    lines.append('<p class="section-intro">Palette classification based on hue distribution, contrast range, and color '
+                 'relationships. Lightness (L) and chroma (saturation) ranges show tonal spread.</p>')
     lines.append(f'<h1>{synthesis.scheme_type}</h1>')
     lines.append(f'<p class="meta">{synthesis.scheme_description}</p>')
     lines.append(f'<p class="meta">Source: {safe_path}</p>')
     lines.append(f'<p class="meta">Lightness: {synthesis.lightness_range[0]:.0f}–{synthesis.lightness_range[1]:.0f} | '
                  f'Chroma: {synthesis.chroma_range[0]:.0f}–{synthesis.chroma_range[1]:.0f} | '
                  f'{len(synthesis.notable_colors)} colors</p>')
+    lines.append(f'<p class="meta">Distribution: {synthesis.distribution_analysis}</p>')
 
     # Palette strip
     lines.append('<div class="palette-strip">')
@@ -2681,6 +2715,11 @@ def render_html(synthesis: SynthesisResult, features: FeatureData, image_path: s
 
     # Color details
     lines.append('<h2>Colors</h2>')
+    lines.append('<p class="section-intro">Colors ranked by visual prominence. '
+                 '<strong>Dominant</strong> = highest coverage, '
+                 '<strong>Secondary</strong> = next most prominent, '
+                 '<strong>Accent</strong> = high contrast or saturation with lower coverage, '
+                 '<strong>Dark/Light</strong> = value extremes for text and backgrounds.</p>')
     for color in synthesis.notable_colors:
         text_color = text_color_for_background(color.lab[0])
         coverage_str = f"{color.coverage*100:.1f}%" if color.coverage >= 0.001 else "<0.1%"
@@ -2698,6 +2737,9 @@ def render_html(synthesis: SynthesisResult, features: FeatureData, image_path: s
     # Gradients
     if synthesis.gradients:
         lines.append('<h2>Gradients</h2>')
+        lines.append('<p class="section-intro">Smooth color transitions detected in the image. '
+                     'Gradients indicate areas where colors blend spatially — useful for background design or identifying lighting effects. '
+                     'Direction shows the transition axis; span measures the lightness range across stops.</p>')
         fine_size = FINE_SCALE * JND
 
         for grad in synthesis.gradients:
@@ -2748,6 +2790,10 @@ def render_html(synthesis: SynthesisResult, features: FeatureData, image_path: s
 
     # Relationships
     lines.append('<h2>Relationships</h2>')
+    lines.append('<p class="section-intro">How colors interact. '
+                 '<strong>Contrast pairs</strong> have high visual separation — rated by WCAG accessibility standards '
+                 '(AAA ≥7:1, AA ≥4.5:1, AA-large ≥3:1). '
+                 '<strong>Harmonic pairs</strong> share similar hue and naturally complement each other.</p>')
 
     # Contrast pairs
     if synthesis.contrast_pairs:
@@ -2776,14 +2822,18 @@ def render_html(synthesis: SynthesisResult, features: FeatureData, image_path: s
         for pair in synthesis.harmonic_pairs:
             hex_a = name_to_hex.get(pair.color_a, '#888')
             hex_b = name_to_hex.get(pair.color_b, '#888')
+            L_a = name_to_L.get(pair.color_a, 50)
+            L_b = name_to_L.get(pair.color_b, 50)
+            text_a = text_color_for_background(L_a)
+            text_b = text_color_for_background(L_b)
             lines.append('<div class="harmonic-pair">')
-            lines.append(f'  <div class="swatch" style="background:{hex_a}"></div>')
-            lines.append(f'  <div class="swatch" style="background:{hex_b}"></div>')
-            lines.append(f'  <span>{pair.color_a} and {pair.color_b}: {pair.hue_difference:.0f}° apart</span>')
+            lines.append('  <div class="harmonic-swatches">')
+            lines.append(f'    <div class="swatch" style="background:{hex_a}; color:{text_a}">{hex_a}</div>')
+            lines.append(f'    <div class="swatch" style="background:{hex_b}; color:{text_b}">{hex_b}</div>')
+            lines.append('  </div>')
+            lines.append(f'  <div class="harmonic-info"><span class="names">{pair.color_a}</span> and '
+                        f'<span class="names">{pair.color_b}</span>: {pair.hue_difference:.0f}° apart</div>')
             lines.append('</div>')
-
-    # Distribution
-    lines.append(f'<p class="distribution"><strong>Distribution:</strong> {synthesis.distribution_analysis}</p>')
 
     lines.append('</body>')
     lines.append('</html>')
