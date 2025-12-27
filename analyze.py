@@ -1107,6 +1107,45 @@ def circular_hue_distance(hue1: float, hue2: float) -> float:
     return min(diff, 360 - diff)
 
 
+def encode_bins(bins: np.ndarray) -> np.ndarray:
+    """
+    Encode 3D bin indices to single int64 values for fast numpy operations.
+
+    Args:
+        bins: Array of shape (..., 3) with int32 bin indices (L, a, b)
+
+    Returns:
+        Array of shape (...) with int64 encoded values
+    """
+    # Shift to positive range (bins can be negative for a/b channels)
+    # L bins: 0 to ~43, a/b bins: -56 to +55 (all fit in 8 bits after +128 shift)
+    shifted = bins.astype(np.int64) + 128
+    return shifted[..., 0] * 65536 + shifted[..., 1] * 256 + shifted[..., 2]
+
+
+def encode_bin_key(bin_key: BinKey) -> int:
+    """Encode a single bin key tuple to int64 (avoids array creation overhead)."""
+    L, a, b = bin_key
+    return (L + 128) * 65536 + (a + 128) * 256 + (b + 128)
+
+
+def decode_bins(encoded: np.ndarray) -> np.ndarray:
+    """
+    Decode int64 encoded bins back to 3D bin indices.
+
+    Args:
+        encoded: Array of int64 encoded bin values
+
+    Returns:
+        Array of shape (..., 3) with int32 bin indices (L, a, b)
+    """
+    encoded = encoded.astype(np.int64)
+    L = (encoded // 65536) - 128
+    a = ((encoded % 65536) // 256) - 128
+    b = (encoded % 256) - 128
+    return np.stack([L, a, b], axis=-1).astype(np.int32)
+
+
 # =============================================================================
 # Stage 1: Data Preparation
 # =============================================================================
@@ -1459,13 +1498,12 @@ def build_adjacency_graph(data: PreparedData) -> tuple[dict, dict]:
     """
     Build adjacency graph at fine scale with 8-connectivity.
 
-    Uses vectorized numpy operations on stored fine_binned array.
+    Uses vectorized numpy operations with bin encoding for fast aggregation.
 
     Returns:
         adjacency: {(b1, b2): count} - symmetric edge counts
         directional: {(b1, b2): {'right': n, 'left': n, ...}} - directional counts
     """
-    h, w = data.image_shape
     fine_binned = data.fine_binned  # (h, w, 3) array
 
     # Direction mappings: (dy, dx) -> direction name
@@ -1476,11 +1514,12 @@ def build_adjacency_graph(data: PreparedData) -> tuple[dict, dict]:
     ]
     ALL_DIRS = [name for _, name in DIRECTIONS]
 
-    adjacency: dict[tuple[BinKey, BinKey], int] = {}
-    directional: dict[tuple[BinKey, BinKey], dict[str, int]] = {}
+    # Collect all edges across all directions
+    all_src_encoded: list[np.ndarray] = []
+    all_nbr_encoded: list[np.ndarray] = []
+    all_dir_indices: list[np.ndarray] = []
 
-    # Process each direction using array slicing (vectorized boundary handling)
-    for (dy, dx), dir_name in DIRECTIONS:
+    for dir_idx, ((dy, dx), dir_name) in enumerate(DIRECTIONS):
         # Define slices for source and neighbor regions
         if dy == -1:
             src_y, nbr_y = slice(1, None), slice(None, -1)
@@ -1503,27 +1542,69 @@ def build_adjacency_graph(data: PreparedData) -> tuple[dict, dict]:
         # Find where colors differ (edge exists)
         diff_mask = np.any(src != nbr, axis=2)
 
-        # Get coordinates where edges exist
+        # Get bin values at edge locations
         edge_ys, edge_xs = np.where(diff_mask)
+        if len(edge_ys) == 0:
+            continue
 
-        # Extract bin values at edge locations
-        src_bins = src[edge_ys, edge_xs]
-        nbr_bins = nbr[edge_ys, edge_xs]
+        src_bins = src[edge_ys, edge_xs]  # (n_edges, 3)
+        nbr_bins = nbr[edge_ys, edge_xs]  # (n_edges, 3)
 
-        # Convert to tuples and count (this loop is over edges, not pixels)
-        for i in range(len(edge_ys)):
-            b1 = tuple(src_bins[i])
-            b2 = tuple(nbr_bins[i])
+        # Encode bins to int64 for fast operations
+        src_encoded = encode_bins(src_bins)
+        nbr_encoded = encode_bins(nbr_bins)
 
-            # Symmetric count
-            sym_key = (b1, b2) if b1 < b2 else (b2, b1)
-            adjacency[sym_key] = adjacency.get(sym_key, 0) + 1
+        all_src_encoded.append(src_encoded)
+        all_nbr_encoded.append(nbr_encoded)
+        all_dir_indices.append(np.full(len(src_encoded), dir_idx, dtype=np.int64))
 
-            # Directional count
-            dir_key = (b1, b2)
-            if dir_key not in directional:
-                directional[dir_key] = {d: 0 for d in ALL_DIRS}
-            directional[dir_key][dir_name] += 1
+    # Early exit if no edges found
+    if not all_src_encoded:
+        return {}, {}
+
+    # Concatenate all edges
+    src_all = np.concatenate(all_src_encoded)
+    nbr_all = np.concatenate(all_nbr_encoded)
+    dir_all = np.concatenate(all_dir_indices)
+
+    # === Build symmetric adjacency using np.unique ===
+    # Sort each pair so (a,b) and (b,a) map to same key
+    pairs = np.column_stack([src_all, nbr_all])
+    symmetric_pairs = np.sort(pairs, axis=1)
+
+    # Aggregate counts with np.unique
+    unique_sym, sym_counts = np.unique(symmetric_pairs, axis=0, return_counts=True)
+
+    # Decode all bins at once (vectorized), then build dict
+    decoded_sym_b1 = decode_bins(unique_sym[:, 0])  # (n, 3)
+    decoded_sym_b2 = decode_bins(unique_sym[:, 1])  # (n, 3)
+
+    adjacency: dict[tuple[BinKey, BinKey], int] = {}
+    for i in range(len(unique_sym)):
+        b1 = tuple(decoded_sym_b1[i])
+        b2 = tuple(decoded_sym_b2[i])
+        adjacency[(b1, b2)] = int(sym_counts[i])
+
+    # === Build directional counts using np.unique ===
+    # Stack (src, nbr, direction) triplets
+    directed_triplets = np.column_stack([src_all, nbr_all, dir_all])
+    unique_dir, dir_counts = np.unique(directed_triplets, axis=0, return_counts=True)
+
+    # Decode all bins at once (vectorized), then build dict
+    decoded_dir_b1 = decode_bins(unique_dir[:, 0])  # (n, 3)
+    decoded_dir_b2 = decode_bins(unique_dir[:, 1])  # (n, 3)
+
+    directional: dict[tuple[BinKey, BinKey], dict[str, int]] = {}
+    for i in range(len(unique_dir)):
+        b1 = tuple(decoded_dir_b1[i])
+        b2 = tuple(decoded_dir_b2[i])
+        dir_idx = int(unique_dir[i, 2])
+        dir_name = ALL_DIRS[dir_idx]
+
+        key = (b1, b2)
+        if key not in directional:
+            directional[key] = {d: 0 for d in ALL_DIRS}
+        directional[key][dir_name] = int(dir_counts[i])
 
     return adjacency, directional
 
@@ -1593,8 +1674,12 @@ def compute_color_metrics(data: PreparedData, adjacency: dict, stability: dict) 
 
 def compute_coherence(data: PreparedData) -> dict[BinKey, float]:
     """Compute spatial coherence for each coarse bin."""
-    # Use stored array directly instead of rebuilding from positions
     coarse_binned = data.coarse_binned
+    h, w = data.image_shape
+
+    # Pre-encode coarse bins to int64 for fast scalar comparison
+    # This replaces 3-element array comparison with single integer comparison
+    coarse_encoded = encode_bins(coarse_binned.reshape(-1, 3)).reshape(h, w)
 
     coherence: dict[BinKey, float] = {}
     structure = np.ones((3, 3), dtype=int)
@@ -1604,8 +1689,9 @@ def compute_coherence(data: PreparedData) -> dict[BinKey, float]:
             coherence[coarse_bin] = 0.0
             continue
 
-        # Create mask for this bin
-        mask = np.all(coarse_binned == coarse_bin, axis=2)
+        # Encode bin key and compare as scalar (much faster than 3-way comparison)
+        bin_encoded = encode_bin_key(coarse_bin)
+        mask = coarse_encoded == bin_encoded
 
         # Find connected components
         labeled, num_blobs = label(mask, structure=structure)
