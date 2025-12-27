@@ -6,12 +6,18 @@ Extracts color schemes from images and produces prose reports for LLM consumptio
 Four stages: Data Preparation → Feature Extraction → Synthesis → Render
 """
 
+import functools
+import math
+from html import escape as html_escape
+
 import numpy as np
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from scipy.ndimage import label
 from dataclasses import dataclass, field
-from typing import Optional
-import math
+
+# Type aliases for clarity
+BinKey = tuple[int, int, int]
+Position = tuple[int, int]
 
 
 # =============================================================================
@@ -989,24 +995,13 @@ XKCD_COLORS = (
     ('Purple', 126, 30, 156),
 )
 
-# Cache for XKCD colors in LAB space (computed on first use)
-# Stores (names_list, lab_array) for vectorized lookup
-_xkcd_lab_cache: Optional[tuple[list[str], np.ndarray]] = None
-
-
-def _get_xkcd_lab_colors() -> tuple[list[str], np.ndarray]:
+@functools.lru_cache(maxsize=1)
+def _get_xkcd_lab_colors() -> tuple[tuple[str, ...], np.ndarray]:
     """Get XKCD colors converted to LAB space. Cached after first call."""
-    global _xkcd_lab_cache
-    if _xkcd_lab_cache is None:
-        names = []
-        labs = []
-        for name, r, g, b in XKCD_COLORS:
-            rgb = np.array([[r, g, b]])
-            lab = rgb_to_lab(rgb)[0]
-            names.append(name)
-            labs.append(lab)
-        _xkcd_lab_cache = (names, np.array(labs))
-    return _xkcd_lab_cache
+    names = tuple(name for name, *_ in XKCD_COLORS)
+    rgb_array = np.array([[r, g, b] for _, r, g, b in XKCD_COLORS])
+    labs = rgb_to_lab(rgb_array)  # Single batched call instead of 949 individual calls
+    return names, labs
 
 
 # =============================================================================
@@ -1084,7 +1079,7 @@ def lab_to_hex(lab: np.ndarray) -> str:
     return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
 
 
-def lab_to_rgb_tuple(lab: np.ndarray) -> tuple:
+def lab_to_rgb_tuple(lab: np.ndarray) -> tuple[int, int, int]:
     """Convert LAB to RGB tuple."""
     rgb = lab_to_rgb(lab)
     if rgb.ndim > 1:
@@ -1098,12 +1093,12 @@ def lab_to_rgb_tuple(lab: np.ndarray) -> tuple:
 
 def compute_chroma(lab: np.ndarray) -> float:
     """Compute chroma (saturation) from LAB coordinates."""
-    return math.sqrt(lab[1]**2 + lab[2]**2)
+    return float(np.sqrt(lab[1]**2 + lab[2]**2))
 
 
 def compute_hue(lab: np.ndarray) -> float:
     """Compute hue angle (0-360 degrees) from LAB coordinates."""
-    return math.degrees(math.atan2(lab[2], lab[1])) % 360
+    return float(np.degrees(np.arctan2(lab[2], lab[1])) % 360)
 
 
 def circular_hue_distance(hue1: float, hue2: float) -> float:
@@ -1121,18 +1116,21 @@ class BinData:
     """Data for a single color bin."""
     lab: np.ndarray  # Representative LAB value
     count: int  # Pixel count
-    positions: list = field(default_factory=list)  # (y, x) positions
+    positions: list[Position] = field(default_factory=list)  # (y, x) positions
 
 
 @dataclass
 class PreparedData:
     """Output of Stage 1: Data Preparation."""
-    fine_bins: dict  # bin_tuple -> BinData
-    coarse_bins: dict  # bin_tuple -> BinData
-    fine_to_coarse: dict  # fine_bin -> coarse_bin
-    coarse_to_fine: dict  # coarse_bin -> [fine_bins]
+    fine_bins: dict[BinKey, BinData]
+    coarse_bins: dict[BinKey, BinData]
+    fine_to_coarse: dict[BinKey, BinKey]
+    coarse_to_fine: dict[BinKey, list[BinKey]]
     total_pixels: int
-    image_shape: tuple  # (height, width)
+    image_shape: tuple[int, int]
+    # Pre-built arrays for vectorized operations
+    fine_binned: np.ndarray  # (h, w, 3) array of fine bin indices
+    coarse_binned: np.ndarray  # (h, w, 3) array of coarse bin indices
 
 
 def prepare_data(image_path: str) -> PreparedData:
@@ -1151,8 +1149,10 @@ def prepare_data(image_path: str) -> PreparedData:
         img = Image.open(image_path)
     except FileNotFoundError:
         raise FileNotFoundError(f"Image not found: {image_path}")
-    except Exception as e:
-        raise ValueError(f"Could not open image: {e}")
+    except UnidentifiedImageError as e:
+        raise ValueError(f"Not a valid image file: {e}")
+    except IOError as e:
+        raise ValueError(f"Could not read image: {e}")
 
     # Validate image dimensions (security: prevent decompression bombs)
     width, height = img.size
@@ -1181,39 +1181,49 @@ def prepare_data(image_path: str) -> PreparedData:
     fine_binned = np.round(lab_image / fine_size).astype(np.int32)
     coarse_binned = np.round(lab_image / coarse_size).astype(np.int32)
 
-    # Build bin data structures
-    fine_bins = {}
-    coarse_bins = {}
-    fine_to_coarse = {}
-    coarse_to_fine = {}
+    # Vectorized bin data extraction using np.unique
+    # Reshape to (n_pixels, 3) for unique operation
+    fine_flat = fine_binned.reshape(-1, 3)
+    coarse_flat = coarse_binned.reshape(-1, 3)
 
-    for y in range(h):
-        for x in range(w):
-            fine_bin = tuple(fine_binned[y, x])
-            coarse_bin = tuple(coarse_binned[y, x])
+    # Get unique bins and counts for fine scale
+    fine_unique, fine_inverse, fine_counts = np.unique(
+        fine_flat, axis=0, return_inverse=True, return_counts=True
+    )
 
-            # Fine bin
-            if fine_bin not in fine_bins:
-                fine_lab = np.array(fine_bin) * fine_size
-                fine_bins[fine_bin] = BinData(lab=fine_lab, count=0, positions=[])
-            fine_bins[fine_bin].count += 1
-            fine_bins[fine_bin].positions.append((y, x))
+    # Get unique bins and counts for coarse scale
+    coarse_unique, coarse_inverse, coarse_counts = np.unique(
+        coarse_flat, axis=0, return_inverse=True, return_counts=True
+    )
 
-            # Coarse bin
-            if coarse_bin not in coarse_bins:
-                coarse_lab = np.array(coarse_bin) * coarse_size
-                coarse_bins[coarse_bin] = BinData(lab=coarse_lab, count=0, positions=[])
-            coarse_bins[coarse_bin].count += 1
-            coarse_bins[coarse_bin].positions.append((y, x))
+    # Build fine bins dict (without positions - use arrays directly)
+    fine_bins: dict[BinKey, BinData] = {}
+    for i, (bin_arr, count) in enumerate(zip(fine_unique, fine_counts)):
+        bin_key = tuple(bin_arr)
+        fine_lab = bin_arr.astype(np.float64) * fine_size
+        fine_bins[bin_key] = BinData(lab=fine_lab, count=int(count), positions=[])
 
-            # Scale mapping
-            fine_to_coarse[fine_bin] = coarse_bin
-            if coarse_bin not in coarse_to_fine:
-                coarse_to_fine[coarse_bin] = set()
-            coarse_to_fine[coarse_bin].add(fine_bin)
+    # Build coarse bins dict
+    coarse_bins: dict[BinKey, BinData] = {}
+    for i, (bin_arr, count) in enumerate(zip(coarse_unique, coarse_counts)):
+        bin_key = tuple(bin_arr)
+        coarse_lab = bin_arr.astype(np.float64) * coarse_size
+        coarse_bins[bin_key] = BinData(lab=coarse_lab, count=int(count), positions=[])
 
-    # Convert sets to lists
-    coarse_to_fine = {k: list(v) for k, v in coarse_to_fine.items()}
+    # Build scale mappings using vectorized lookup
+    # For each fine bin, find corresponding coarse bin
+    fine_to_coarse: dict[BinKey, BinKey] = {}
+    coarse_to_fine: dict[BinKey, list[BinKey]] = {}
+
+    for fine_bin in fine_bins:
+        # Get one pixel position with this fine bin to find its coarse bin
+        fine_arr = np.array(fine_bin)
+        coarse_arr = np.round(fine_arr * fine_size / coarse_size).astype(np.int32)
+        coarse_bin = tuple(coarse_arr)
+        fine_to_coarse[fine_bin] = coarse_bin
+        if coarse_bin not in coarse_to_fine:
+            coarse_to_fine[coarse_bin] = []
+        coarse_to_fine[coarse_bin].append(fine_bin)
 
     return PreparedData(
         fine_bins=fine_bins,
@@ -1221,7 +1231,9 @@ def prepare_data(image_path: str) -> PreparedData:
         fine_to_coarse=fine_to_coarse,
         coarse_to_fine=coarse_to_fine,
         total_pixels=h * w,
-        image_shape=(h, w)
+        image_shape=(h, w),
+        fine_binned=fine_binned,
+        coarse_binned=coarse_binned,
     )
 
 
@@ -1235,29 +1247,29 @@ class StabilityInfo:
     stability_type: str  # 'anchor', 'gradient', 'texture'
     fine_count: int  # Number of fine children
     fine_variance: float  # LAB variance of fine children
-    dominant_axis: Optional[str] = None  # 'L', 'a', 'b' if gradient
+    dominant_axis: str | None = None  # 'L', 'a', 'b' if gradient
 
 
 @dataclass
 class ColorFamily:
     """A group of colors with similar hue."""
     hue_center: float  # 0-360
-    lightness_range: tuple  # (min_L, max_L)
-    chroma_range: tuple  # (min, max)
+    lightness_range: tuple[float, float]
+    chroma_range: tuple[float, float]
     total_coverage: float  # 0-1
-    members: list  # coarse bin tuples
+    members: list[BinKey]
     is_neutral: bool = False
 
 
 @dataclass
 class GradientChain:
     """A detected gradient in the image."""
-    stops: list  # List of coarse bins (anchor colors only)
-    fine_members: list  # All fine bins in the chain
+    stops: list[BinKey]  # Coarse bins (anchor colors only)
+    fine_members: list[BinKey]  # All fine bins in the chain
     direction: str  # 'horizontal', 'vertical', 'diagonal', 'mixed'
     coverage: float  # Total pixel coverage
-    lab_range: dict  # {'L': (min, max), 'a': (min, max), 'b': (min, max)}
-    family_span: list  # Which families this gradient spans
+    lab_range: dict[str, tuple[float, float]]  # {'L': (min, max), ...}
+    family_span: list[int]  # Which family indices this gradient spans
 
 
 @dataclass
@@ -1275,11 +1287,11 @@ class ColorMetrics:
 @dataclass
 class FeatureData:
     """Output of Stage 2: Feature Extraction."""
-    stability: dict  # coarse_bin -> StabilityInfo
-    families: list  # List of ColorFamily
-    gradients: list  # List of GradientChain
-    metrics: dict  # coarse_bin -> ColorMetrics
-    adjacency: dict  # (bin1, bin2) -> count (fine scale)
+    stability: dict[BinKey, StabilityInfo]
+    families: list[ColorFamily]
+    gradients: list[GradientChain]
+    metrics: dict[BinKey, ColorMetrics]
+    adjacency: dict[tuple[BinKey, BinKey], int]  # (bin1, bin2) -> count
 
 
 def analyze_scale_stability(data: PreparedData) -> dict:
@@ -1447,44 +1459,67 @@ def build_adjacency_graph(data: PreparedData) -> tuple[dict, dict]:
     """
     Build adjacency graph at fine scale with 8-connectivity.
 
+    Uses vectorized numpy operations on stored fine_binned array.
+
     Returns:
         adjacency: {(b1, b2): count} - symmetric edge counts
         directional: {(b1, b2): {'right': n, 'left': n, ...}} - directional counts
     """
+    h, w = data.image_shape
+    fine_binned = data.fine_binned  # (h, w, 3) array
+
     # Direction mappings: (dy, dx) -> direction name
-    # Direction is "where b2 is relative to b1"
-    DIRECTIONS = {
-        (-1, -1): 'up_left',    (-1, 0): 'above',    (-1, 1): 'up_right',
-        (0, -1): 'left',                              (0, 1): 'right',
-        (1, -1): 'down_left',   (1, 0): 'below',     (1, 1): 'down_right'
-    }
-    ALL_DIRS = list(DIRECTIONS.values())
+    DIRECTIONS = [
+        ((-1, -1), 'up_left'),    ((-1, 0), 'above'),    ((-1, 1), 'up_right'),
+        ((0, -1), 'left'),                                ((0, 1), 'right'),
+        ((1, -1), 'down_left'),   ((1, 0), 'below'),     ((1, 1), 'down_right')
+    ]
+    ALL_DIRS = [name for _, name in DIRECTIONS]
 
-    adjacency = {}
-    directional = {}
+    adjacency: dict[tuple[BinKey, BinKey], int] = {}
+    directional: dict[tuple[BinKey, BinKey], dict[str, int]] = {}
 
-    # Rebuild fine binned image for adjacency
-    fine_binned = {}
-    for fine_bin, bin_data in data.fine_bins.items():
-        for pos in bin_data.positions:
-            fine_binned[pos] = fine_bin
+    # Process each direction using array slicing (vectorized boundary handling)
+    for (dy, dx), dir_name in DIRECTIONS:
+        # Define slices for source and neighbor regions
+        if dy == -1:
+            src_y, nbr_y = slice(1, None), slice(None, -1)
+        elif dy == 1:
+            src_y, nbr_y = slice(None, -1), slice(1, None)
+        else:
+            src_y, nbr_y = slice(None), slice(None)
 
-    # Check all 8 neighbors for each pixel
-    for (y, x), b1 in fine_binned.items():
-        for (dy, dx), dir_name in DIRECTIONS.items():
-            ny, nx = y + dy, x + dx
-            if (ny, nx) not in fine_binned:
-                continue
+        if dx == -1:
+            src_x, nbr_x = slice(1, None), slice(None, -1)
+        elif dx == 1:
+            src_x, nbr_x = slice(None, -1), slice(1, None)
+        else:
+            src_x, nbr_x = slice(None), slice(None)
 
-            b2 = fine_binned[(ny, nx)]
-            if b1 == b2:
-                continue
+        # Extract aligned regions
+        src = fine_binned[src_y, src_x]  # Source pixels
+        nbr = fine_binned[nbr_y, nbr_x]  # Neighbor pixels in this direction
+
+        # Find where colors differ (edge exists)
+        diff_mask = np.any(src != nbr, axis=2)
+
+        # Get coordinates where edges exist
+        edge_ys, edge_xs = np.where(diff_mask)
+
+        # Extract bin values at edge locations
+        src_bins = src[edge_ys, edge_xs]
+        nbr_bins = nbr[edge_ys, edge_xs]
+
+        # Convert to tuples and count (this loop is over edges, not pixels)
+        for i in range(len(edge_ys)):
+            b1 = tuple(src_bins[i])
+            b2 = tuple(nbr_bins[i])
 
             # Symmetric count
             sym_key = (b1, b2) if b1 < b2 else (b2, b1)
             adjacency[sym_key] = adjacency.get(sym_key, 0) + 1
 
-            # Directional count: b2 is in dir_name direction from b1
+            # Directional count
             dir_key = (b1, b2)
             if dir_key not in directional:
                 directional[dir_key] = {d: 0 for d in ALL_DIRS}
@@ -1556,18 +1591,12 @@ def compute_color_metrics(data: PreparedData, adjacency: dict, stability: dict) 
     return metrics
 
 
-def compute_coherence(data: PreparedData) -> dict:
+def compute_coherence(data: PreparedData) -> dict[BinKey, float]:
     """Compute spatial coherence for each coarse bin."""
-    h, w = data.image_shape
-    coarse_size = COARSE_SCALE * JND
+    # Use stored array directly instead of rebuilding from positions
+    coarse_binned = data.coarse_binned
 
-    # Rebuild coarse binned image
-    coarse_binned = np.zeros((h, w, 3), dtype=np.int32)
-    for coarse_bin, bin_data in data.coarse_bins.items():
-        for y, x in bin_data.positions:
-            coarse_binned[y, x] = coarse_bin
-
-    coherence = {}
+    coherence: dict[BinKey, float] = {}
     structure = np.ones((3, 3), dtype=int)
 
     for coarse_bin, bin_data in data.coarse_bins.items():
@@ -1575,7 +1604,7 @@ def compute_coherence(data: PreparedData) -> dict:
             coherence[coarse_bin] = 0.0
             continue
 
-        # Create mask
+        # Create mask for this bin
         mask = np.all(coarse_binned == coarse_bin, axis=2)
 
         # Find connected components
@@ -2040,17 +2069,17 @@ def extract_features(data: PreparedData) -> FeatureData:
 @dataclass
 class NotableColor:
     """A significant color in the palette."""
-    coarse_bin: tuple
+    coarse_bin: BinKey
     lab: np.ndarray
     hex: str
-    rgb: tuple
+    rgb: tuple[int, int, int]
     name: str
     role: str  # 'dominant', 'secondary', 'accent', 'dark', 'light'
     coverage: float
     chroma: float
     significance: float
-    characteristics: list  # Descriptive strings
-    gradient_membership: list  # Indices into gradients list
+    characteristics: list[str]
+    gradient_membership: list[int]  # Indices into gradients list
 
 
 @dataclass
@@ -2076,13 +2105,13 @@ class SynthesisResult:
     """Output of Stage 3: Synthesis."""
     scheme_type: str
     scheme_description: str
-    notable_colors: list  # List of NotableColor
-    gradients: list  # GradientChain (filtered to significant ones)
-    contrast_pairs: list  # ContrastPair
-    harmonic_pairs: list  # HarmonicPair
+    notable_colors: list[NotableColor]
+    gradients: list[GradientChain]
+    contrast_pairs: list[ContrastPair]
+    harmonic_pairs: list[HarmonicPair]
     distribution_analysis: str
-    lightness_range: tuple
-    chroma_range: tuple
+    lightness_range: tuple[float, float]
+    chroma_range: tuple[float, float]
 
 
 def compute_significance(metrics: ColorMetrics, stability: StabilityInfo,
@@ -2126,18 +2155,14 @@ def generate_color_name(lab: np.ndarray) -> str:
     return names[np.argmin(distances)]
 
 
-def classify_role(metrics: ColorMetrics, all_metrics: dict, is_accent: bool) -> str:
-    """Classify the descriptive role of a color."""
+def classify_role(metrics: ColorMetrics, coverage_rank: int, is_accent: bool) -> str:
+    """Classify the descriptive role of a color based on pre-computed rank."""
     if is_accent:
         return "accent"
 
-    # Find coverage rank
-    coverages = sorted([m.coverage for m in all_metrics.values()], reverse=True)
-    rank = coverages.index(metrics.coverage) if metrics.coverage in coverages else len(coverages)
-
-    if rank == 0:
+    if coverage_rank == 0:
         return "dominant"
-    elif rank <= 2:
+    elif coverage_rank <= 2:
         return "secondary"
     elif metrics.lab[0] < 30:
         return "dark"
@@ -2324,6 +2349,14 @@ def synthesize(data: PreparedData, features: FeatureData) -> SynthesisResult:
             metrics.isolation > 0.3):
             accent_bins.add(coarse_bin)
 
+    # Pre-compute coverage ranks (O(n log n) once, instead of O(n²))
+    sorted_by_coverage = sorted(
+        features.metrics.items(),
+        key=lambda x: x[1].coverage,
+        reverse=True
+    )
+    coverage_ranks = {bin_key: rank for rank, (bin_key, _) in enumerate(sorted_by_coverage)}
+
     # Build NotableColor objects
     notable_colors = []
     for coarse_bin, sig_score in notable_bins:
@@ -2331,7 +2364,7 @@ def synthesize(data: PreparedData, features: FeatureData) -> SynthesisResult:
         stab = features.stability.get(coarse_bin, StabilityInfo('texture', 0, 0))
 
         is_accent = coarse_bin in accent_bins
-        role = classify_role(metrics, features.metrics, is_accent)
+        role = classify_role(metrics, coverage_ranks.get(coarse_bin, len(coverage_ranks)), is_accent)
 
         # Count gradient membership
         gradient_count = sum(1 for g in features.gradients if coarse_bin in g.stops)
@@ -2526,9 +2559,7 @@ def text_color_for_background(L: float) -> str:
 
 def render_html(synthesis: SynthesisResult, features: FeatureData, image_path: str) -> str:
     """Stage 4b: Render synthesis result as HTML."""
-    from html import escape
-
-    safe_path = escape(image_path)
+    safe_path = html_escape(image_path)
 
     # Build name lookups once for contrast/harmonic pairs
     name_to_hex = {c.name: c.hex for c in synthesis.notable_colors}
@@ -2906,7 +2937,12 @@ if __name__ == '__main__':
     # Run analysis
     try:
         prose, html = analyze_image(str(image_path))
+    except KeyboardInterrupt:
+        sys.exit(130)
     except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
