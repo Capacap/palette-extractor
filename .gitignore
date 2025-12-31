@@ -5,3 +5,10 @@ output/
 source_images/
 .claude/
 .context/
+
+# Development/internal files
+archive/
+batch_analyze.py
+debug_gradients.py
+profile_analyze.py
+*.egg-info/

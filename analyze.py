@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["pillow>=10.0.0", "numpy>=1.24.0", "scipy>=1.11.0"]
+# ///
 """
 Unified color analysis pipeline.
 
@@ -3015,7 +3019,8 @@ def analyze_image(image_path: str, downscale: bool = True) -> tuple[str, str]:
 # CLI
 # =============================================================================
 
-if __name__ == '__main__':
+def main():
+    """CLI entry point for palette extraction."""
     import argparse
     import sys
     from pathlib import Path
@@ -3075,3 +3080,7 @@ if __name__ == '__main__':
         except OSError as e:
             print(f"Error writing output: {e}", file=sys.stderr)
             sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

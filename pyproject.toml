@@ -1,9 +1,16 @@
 [project]
-name = "color-extractor"
+name = "palette-extractor"
 version = "0.2.0"
-description = "Extract color palettes from images"
+description = "Extract color palettes from images for web design. Produces LLM-consumable prose with color roles, WCAG contrast pairs, and harmonic relationships."
 requires-python = ">=3.10"
 dependencies = [
     "pillow>=10.0.0",
     "numpy>=1.24.0",
+    "scipy>=1.11.0",
 ]
+
+[project.scripts]
+palette-extractor = "analyze:main"
+
+[tool.setuptools]
+py-modules = ["analyze"]
