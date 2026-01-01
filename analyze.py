@@ -44,6 +44,11 @@ MIN_SIGNIFICANCE_RATIO = 0.05  # Minimum significance relative to top color
 MAX_NOTABLE_COLORS = 10  # Maximum colors to include in output
 GRADIENT_ANGLE_THRESHOLD = 74  # Degrees; reject gradients with mean local angle above this
 
+# Similarity penalty parameters (for diverse palette selection)
+SIMILARITY_DELTA_E_THRESHOLD = 25.0  # LAB distance at which colors are "fully different"
+COVERAGE_PROTECTION_ANCHOR = 0.05  # Coverage level (5%) that gets full protection from penalty
+SIMILARITY_PENALTY_WEIGHT = 30.0  # Max penalty subtracted from significance score
+
 # XKCD color survey data (949 colors)
 # Source: https://xkcd.com/color/rgb/ (CC0 1.0 Public Domain)
 # Format: (name, R, G, B)
@@ -1098,6 +1103,11 @@ def lab_to_rgb_tuple(lab: np.ndarray) -> tuple[int, int, int]:
 def compute_chroma(lab: np.ndarray) -> float:
     """Compute chroma (saturation) from LAB coordinates."""
     return float(np.sqrt(lab[1]**2 + lab[2]**2))
+
+
+def delta_e(lab1: np.ndarray, lab2: np.ndarray) -> float:
+    """Compute Delta E (Euclidean distance in LAB space)."""
+    return float(np.linalg.norm(lab1 - lab2))
 
 
 def compute_hue(lab: np.ndarray) -> float:
@@ -2432,13 +2442,38 @@ def synthesize(data: PreparedData, features: FeatureData) -> SynthesisResult:
             metrics, stab, median_chroma, chroma_iqr
         )
 
-    # Select notable colors (top by significance, minimum threshold)
+    # Select notable colors (top by significance, with similarity penalty)
     sorted_bins = sorted(significance_scores.items(), key=lambda x: -x[1])
 
     # Threshold: minimum significance relative to top color
     notable_threshold = max(1, sorted_bins[0][1] * MIN_SIGNIFICANCE_RATIO) if sorted_bins else 1
 
-    notable_bins = [(b, s) for b, s in sorted_bins if s >= notable_threshold][:MAX_NOTABLE_COLORS]
+    # Greedy selection with similarity penalty
+    # High-coverage colors are protected; low-coverage similar colors are penalized
+    notable_bins = []
+    for coarse_bin, sig_score in sorted_bins:
+        if len(notable_bins) >= MAX_NOTABLE_COLORS:
+            break
+
+        metrics = features.metrics[coarse_bin]
+
+        # Compute penalty based on similarity to already-selected colors
+        penalty = 0.0
+        if notable_bins:
+            min_dist = min(
+                delta_e(metrics.lab, features.metrics[sel_bin].lab)
+                for sel_bin, _ in notable_bins
+            )
+            # similarity: 1.0 when identical, 0.0 when >= threshold apart
+            similarity = max(0.0, 1.0 - min_dist / SIMILARITY_DELTA_E_THRESHOLD)
+            # coverage_protection: 1.0 at anchor coverage, 0.0 at zero coverage
+            coverage_protection = min(1.0, metrics.coverage / COVERAGE_PROTECTION_ANCHOR)
+            # Penalty is high for low-coverage colors similar to existing selections
+            penalty = similarity * (1.0 - coverage_protection) * SIMILARITY_PENALTY_WEIGHT
+
+        adjusted_score = sig_score - penalty
+        if adjusted_score >= notable_threshold:
+            notable_bins.append((coarse_bin, sig_score))
 
     # Identify accents: high chroma + low coverage + high isolation
     # Must have at least some coverage to be notable (>0.1%)
