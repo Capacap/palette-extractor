@@ -1,10 +1,10 @@
-# palette-extractor
+# image-palette-extractor
 
 Extract color palettes from images. Produces prose output suitable for LLM consumption, with optional HTML reports for human review.
 
 ## How it works
 
-Unlike simple color extraction that clusters pixels by RGB similarity, palette-extractor analyzes how colors relate to each other spatially:
+Unlike simple color extraction that clusters pixels by RGB similarity, image-palette-extractor analyzes how colors relate to each other spatially:
 
 - **Adjacency graph** — Colors are understood through their neighbors, not in isolation. A yellow next to black has different significance than yellow next to orange.
 - **LAB color space** — All perceptual calculations use LAB, where distances match human perception. Colors 2.3 units apart are one "just noticeable difference."
@@ -17,17 +17,20 @@ Requires Python 3.10+.
 
 ```bash
 # With uv (recommended)
-uvx --from git+https://github.com/Capacap/palette-extractor palette-extractor -i image.png
+uvx image-palette-extractor -i image.png
 
 # Or install globally
-uv tool install git+https://github.com/Capacap/palette-extractor
-palette-extractor -i image.png
+uv tool install image-palette-extractor
+image-palette-extractor -i image.png
+
+# Or with pip
+pip install image-palette-extractor
 ```
 
 ## Usage
 
 ```bash
-palette-extractor -i <image_path> [options]
+image-palette-extractor -i <image_path> [options]
 ```
 
 **Options:**
@@ -52,14 +55,14 @@ Each color shows hex, RGB, LAB values, coverage percentage, and perceptual notes
 
 ```bash
 # Analyze and print to terminal
-palette-extractor -i photo.jpg
+image-palette-extractor -i photo.jpg
 
 # Generate HTML report (auto-named photo-palette.html)
-palette-extractor -i photo.jpg -o
+image-palette-extractor -i photo.jpg -o
 
 # Generate HTML report with custom path
-palette-extractor -i photo.jpg -o report.html
+image-palette-extractor -i photo.jpg -o report.html
 
 # Full resolution analysis (slower, more precise)
-palette-extractor -i photo.jpg --no-downscale
+image-palette-extractor -i photo.jpg --no-downscale
 ```

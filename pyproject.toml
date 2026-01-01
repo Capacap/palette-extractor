@@ -1,7 +1,10 @@
 [project]
-name = "palette-extractor"
-version = "0.2.0"
+name = "image-palette-extractor"
+version = "0.3.0"
 description = "Extract color palettes from images for web design. Produces LLM-consumable prose with color roles, WCAG contrast pairs, and harmonic relationships."
+authors = [{ name = "Simon Sorkin" }]
+license = { text = "MIT" }
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "pillow>=10.0.0",
@@ -10,7 +13,10 @@ dependencies = [
 ]
 
 [project.scripts]
-palette-extractor = "analyze:main"
+image-palette-extractor = "analyze:main"
+
+[project.urls]
+Repository = "https://github.com/Capacap/palette-extractor"
 
 [tool.setuptools]
 py-modules = ["analyze"]
