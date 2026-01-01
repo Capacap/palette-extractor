@@ -49,6 +49,11 @@ SIMILARITY_DELTA_E_THRESHOLD = 25.0  # LAB distance at which colors are "fully d
 COVERAGE_PROTECTION_ANCHOR = 0.05  # Coverage level (5%) that gets full protection from penalty
 SIMILARITY_PENALTY_WEIGHT = 30.0  # Max penalty subtracted from significance score
 
+# Family-based color selection parameters
+FAMILY_CLUSTER_THRESHOLD = 30.0  # LAB distance for grouping colors into families
+MIN_FAMILY_COVERAGE = 0.01  # Minimum coverage (1%) for a family to get automatic representation
+ACCENT_CHROMA_THRESHOLD = 30  # Minimum chroma for low-coverage families to qualify as accents
+
 # XKCD color survey data (949 colors)
 # Source: https://xkcd.com/color/rgb/ (CC0 1.0 Public Domain)
 # Format: (name, R, G, B)
@@ -2225,6 +2230,149 @@ class SynthesisResult:
     chroma_range: tuple[float, float]
 
 
+# =============================================================================
+# Family-based Color Clustering
+# =============================================================================
+
+def cluster_into_families(metrics: dict[BinKey, ColorMetrics],
+                          threshold: float = FAMILY_CLUSTER_THRESHOLD) -> list[list[BinKey]]:
+    """
+    Cluster coarse bins into color families using hierarchical clustering.
+
+    Colors within `threshold` LAB distance are grouped together, capturing
+    perceptually similar colors regardless of their hue/lightness classification.
+    """
+    from scipy.cluster.hierarchy import fcluster, linkage
+
+    bins = list(metrics.keys())
+    if len(bins) < 2:
+        return [[b] for b in bins]
+
+    # Build LAB matrix from metrics
+    labs = np.array([metrics[b].lab for b in bins])
+
+    # Hierarchical clustering with average linkage
+    Z = linkage(labs, method='average', metric='euclidean')
+    labels = fcluster(Z, t=threshold, criterion='distance')
+
+    # Group bins by cluster label
+    families: dict[int, list[BinKey]] = {}
+    for bin_key, label in zip(bins, labels):
+        families.setdefault(label, []).append(bin_key)
+
+    return list(families.values())
+
+
+@dataclass
+class FamilyCluster:
+    """A cluster of perceptually similar colors (LAB-based)."""
+    bins: list[BinKey]
+    coverage: float  # Total coverage of all bins in family
+    avg_lab: np.ndarray  # Centroid in LAB space
+    avg_chroma: float
+    centroid_bin: BinKey  # Bin closest to centroid
+    family_type: str  # 'chromatic', 'dark', 'light', 'neutral_mid'
+
+
+def analyze_families(metrics: dict[BinKey, ColorMetrics],
+                     families: list[list[BinKey]]) -> list[FamilyCluster]:
+    """Compute aggregate statistics for each color family."""
+    family_stats = []
+
+    for family_bins in families:
+        total_coverage = sum(metrics[b].coverage for b in family_bins)
+        avg_lab = np.mean([metrics[b].lab for b in family_bins], axis=0)
+        avg_chroma = np.mean([metrics[b].chroma for b in family_bins])
+        avg_L = avg_lab[0]
+
+        # Find the bin closest to the family centroid
+        centroid_bin = min(family_bins,
+                           key=lambda b: np.linalg.norm(metrics[b].lab - avg_lab))
+
+        # Classify family type
+        if avg_chroma < 15:
+            if avg_L < 25:
+                family_type = 'dark'
+            elif avg_L > 75:
+                family_type = 'light'
+            else:
+                family_type = 'neutral_mid'
+        else:
+            family_type = 'chromatic'
+
+        family_stats.append(FamilyCluster(
+            bins=family_bins,
+            coverage=total_coverage,
+            avg_lab=avg_lab,
+            avg_chroma=avg_chroma,
+            centroid_bin=centroid_bin,
+            family_type=family_type
+        ))
+
+    # Sort by coverage descending
+    family_stats.sort(key=lambda f: -f.coverage)
+    return family_stats
+
+
+def select_colors_by_family(metrics: dict[BinKey, ColorMetrics],
+                            families: list[FamilyCluster],
+                            max_colors: int = MAX_NOTABLE_COLORS) -> list[tuple[BinKey, str]]:
+    """
+    Select notable colors using family-first approach.
+
+    1. Every family above coverage threshold gets one representative
+    2. High-chroma families get representation even at low coverage (accents)
+    3. Fill remaining slots with additional shades from largest families
+
+    Returns list of (bin_key, role) tuples.
+    """
+    selected: list[tuple[BinKey, str]] = []
+    selected_bins: set[BinKey] = set()
+
+    # Step 1: One representative per significant family (by coverage order)
+    significant_families = [f for f in families if f.coverage >= MIN_FAMILY_COVERAGE]
+
+    for fam in significant_families:
+        if len(selected) >= max_colors:
+            break
+        # Pick the bin with highest coverage in this family
+        best_bin = max(fam.bins, key=lambda b: metrics[b].coverage)
+        role = fam.family_type
+        selected.append((best_bin, role))
+        selected_bins.add(best_bin)
+
+    # Step 2: High-chroma accent families (even if low coverage)
+    accent_families = [f for f in families
+                       if f.coverage < MIN_FAMILY_COVERAGE
+                       and f.avg_chroma > ACCENT_CHROMA_THRESHOLD]
+
+    for fam in accent_families:
+        if len(selected) >= max_colors:
+            break
+        # For accents, pick the most saturated bin
+        best_bin = max(fam.bins, key=lambda b: metrics[b].chroma)
+        if best_bin not in selected_bins:
+            selected.append((best_bin, 'accent'))
+            selected_bins.add(best_bin)
+
+    # Step 3: Fill remaining slots with additional shades from largest families
+    for fam in families:
+        if len(selected) >= max_colors:
+            break
+
+        available = [b for b in fam.bins if b not in selected_bins]
+        available.sort(key=lambda b: -metrics[b].coverage)
+
+        for b in available[:2]:  # Up to 2 more per family
+            if len(selected) >= max_colors:
+                break
+            if metrics[b].coverage > 0.005:  # Minimum 0.5% coverage for fills
+                selected.append((b, 'fill'))
+                selected_bins.add(b)
+
+    return selected
+
+
 def compute_significance(metrics: ColorMetrics, stability: StabilityInfo,
                          median_chroma: float, chroma_iqr: float) -> float:
     """Compute significance score for a color.
@@ -2429,78 +2577,35 @@ def determine_scheme_type(families: list, notable_colors: list) -> tuple:
 def synthesize(data: PreparedData, features: FeatureData) -> SynthesisResult:
     """Stage 3: Synthesize features into actionable analysis."""
 
-    # Compute chroma statistics for significance scoring
-    chromas = [m.chroma for m in features.metrics.values()]
-    median_chroma = np.median(chromas) if chromas else 0
-    chroma_iqr = np.percentile(chromas, 75) - np.percentile(chromas, 25) if chromas else 1
+    # Family-based color selection
+    # 1. Cluster colors into perceptually similar families
+    family_clusters = cluster_into_families(features.metrics)
+    families = analyze_families(features.metrics, family_clusters)
 
-    # Compute significance for all coarse bins
-    significance_scores = {}
-    for coarse_bin, metrics in features.metrics.items():
-        stab = features.stability.get(coarse_bin, StabilityInfo('texture', 0, 0))
-        significance_scores[coarse_bin] = compute_significance(
-            metrics, stab, median_chroma, chroma_iqr
-        )
+    # 2. Select colors ensuring each family gets representation
+    selected_colors = select_colors_by_family(features.metrics, families)
 
-    # Select notable colors (top by significance, with similarity penalty)
-    sorted_bins = sorted(significance_scores.items(), key=lambda x: -x[1])
-
-    # Threshold: minimum significance relative to top color
-    notable_threshold = max(1, sorted_bins[0][1] * MIN_SIGNIFICANCE_RATIO) if sorted_bins else 1
-
-    # Greedy selection with similarity penalty
-    # High-coverage colors are protected; low-coverage similar colors are penalized
-    notable_bins = []
-    for coarse_bin, sig_score in sorted_bins:
-        if len(notable_bins) >= MAX_NOTABLE_COLORS:
-            break
-
-        metrics = features.metrics[coarse_bin]
-
-        # Compute penalty based on similarity to already-selected colors
-        penalty = 0.0
-        if notable_bins:
-            min_dist = min(
-                delta_e(metrics.lab, features.metrics[sel_bin].lab)
-                for sel_bin, _ in notable_bins
-            )
-            # similarity: 1.0 when identical, 0.0 when >= threshold apart
-            similarity = max(0.0, 1.0 - min_dist / SIMILARITY_DELTA_E_THRESHOLD)
-            # coverage_protection: 1.0 at anchor coverage, 0.0 at zero coverage
-            coverage_protection = min(1.0, metrics.coverage / COVERAGE_PROTECTION_ANCHOR)
-            # Penalty is high for low-coverage colors similar to existing selections
-            penalty = similarity * (1.0 - coverage_protection) * SIMILARITY_PENALTY_WEIGHT
-
-        adjusted_score = sig_score - penalty
-        if adjusted_score >= notable_threshold:
-            notable_bins.append((coarse_bin, sig_score))
-
-    # Identify accents: high chroma + low coverage + high isolation
-    # Must have at least some coverage to be notable (>0.1%)
-    accent_bins = set()
-    for coarse_bin, metrics in features.metrics.items():
-        if (metrics.chroma > median_chroma + chroma_iqr and
-            metrics.coverage < 0.05 and
-            metrics.coverage > 0.001 and  # At least 0.1% coverage
-            metrics.isolation > 0.3):
-            accent_bins.add(coarse_bin)
-
-    # Pre-compute coverage ranks (O(n log n) once, instead of O(n²))
-    sorted_by_coverage = sorted(
-        features.metrics.items(),
-        key=lambda x: x[1].coverage,
-        reverse=True
-    )
-    coverage_ranks = {bin_key: rank for rank, (bin_key, _) in enumerate(sorted_by_coverage)}
+    # Map family roles to output roles
+    role_mapping = {
+        'chromatic': 'secondary',
+        'dark': 'dark',
+        'light': 'light',
+        'neutral_mid': 'secondary',
+        'accent': 'accent',
+        'fill': 'secondary'
+    }
 
     # Build NotableColor objects
     notable_colors = []
-    for coarse_bin, sig_score in notable_bins:
+    for i, (coarse_bin, family_role) in enumerate(selected_colors):
         metrics = features.metrics[coarse_bin]
         stab = features.stability.get(coarse_bin, StabilityInfo('texture', 0, 0))
 
-        is_accent = coarse_bin in accent_bins
-        role = classify_role(metrics, coverage_ranks.get(coarse_bin, len(coverage_ranks)), is_accent)
+        # First color by coverage is dominant
+        if i == 0:
+            role = 'dominant'
+        else:
+            role = role_mapping.get(family_role, 'secondary')
 
         # Count gradient membership
         gradient_count = sum(1 for g in features.gradients if coarse_bin in g.stops)
@@ -2514,9 +2619,9 @@ def synthesize(data: PreparedData, features: FeatureData) -> SynthesisResult:
             role=role,
             coverage=metrics.coverage,
             chroma=metrics.chroma,
-            significance=sig_score,
+            significance=metrics.coverage * 100,  # Use coverage as significance proxy
             characteristics=generate_characteristics(metrics, stab, role, gradient_count),
-            gradient_membership=[i for i, g in enumerate(features.gradients) if coarse_bin in g.stops]
+            gradient_membership=[idx for idx, g in enumerate(features.gradients) if coarse_bin in g.stops]
         ))
 
     # Sort notable colors: dominant first, then by coverage
