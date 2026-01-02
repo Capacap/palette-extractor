@@ -2196,6 +2196,7 @@ class NotableColor:
     significance: float
     characteristics: list[str]
     gradient_membership: list[int]  # Indices into gradients list
+    family_index: int = 0  # Which perceptual family this color belongs to
 
 
 @dataclass
@@ -2228,6 +2229,7 @@ class SynthesisResult:
     distribution_analysis: str
     lightness_range: tuple[float, float]
     chroma_range: tuple[float, float]
+    family_count: int = 0  # Number of distinct color families in palette
 
 
 # =============================================================================
@@ -2574,6 +2576,62 @@ def determine_scheme_type(families: list, notable_colors: list) -> tuple:
     return "complex", f"Multi-hue palette with {len(chromatic_families)} color families"
 
 
+# Threshold for hue-based family clustering (degrees)
+HUE_FAMILY_THRESHOLD = 45.0
+# Chroma threshold below which colors are considered neutral (true grays)
+NEUTRAL_CHROMA_THRESHOLD = 8.0
+
+
+def assign_hue_families(colors: list['NotableColor']) -> None:
+    """
+    Assign family indices to colors based on hue clustering.
+
+    Groups colors by hue proximity for presentation purposes.
+    Neutrals (low chroma) form their own family.
+    Families are ordered by total coverage (largest first).
+    Mutates the family_index field of each color in place.
+    """
+    if not colors:
+        return
+
+    # Separate neutrals from chromatic colors
+    neutrals = [c for c in colors if c.chroma < NEUTRAL_CHROMA_THRESHOLD]
+    chromatic = [c for c in colors if c.chroma >= NEUTRAL_CHROMA_THRESHOLD]
+
+    # Sort chromatic by coverage so high-coverage colors anchor families
+    chromatic.sort(key=lambda c: -c.coverage)
+
+    # Cluster chromatic colors by hue proximity
+    hue_families: list[list['NotableColor']] = []
+
+    for color in chromatic:
+        hue = compute_hue(color.lab)
+
+        # Find a family with similar hue
+        matched = False
+        for family in hue_families:
+            # Compare to first member's hue (representative)
+            family_hue = compute_hue(family[0].lab)
+            if circular_hue_distance(hue, family_hue) <= HUE_FAMILY_THRESHOLD:
+                family.append(color)
+                matched = True
+                break
+
+        if not matched:
+            hue_families.append([color])
+
+    # Sort families by total coverage (largest first)
+    hue_families.sort(key=lambda fam: -sum(c.coverage for c in fam))
+
+    # Neutrals get their own family if present, placed after chromatic families
+    all_families = hue_families + ([neutrals] if neutrals else [])
+
+    # Assign family indices
+    for family_idx, family in enumerate(all_families):
+        for color in family:
+            color.family_index = family_idx
+
+
 def synthesize(data: PreparedData, features: FeatureData) -> SynthesisResult:
     """Stage 3: Synthesize features into actionable analysis."""
 
@@ -2624,9 +2682,12 @@ def synthesize(data: PreparedData, features: FeatureData) -> SynthesisResult:
             gradient_membership=[idx for idx, g in enumerate(features.gradients) if coarse_bin in g.stops]
         ))
 
-    # Sort notable colors: dominant first, then by coverage
-    role_order = {'dominant': 0, 'secondary': 1, 'dark': 2, 'light': 3, 'accent': 4}
-    notable_colors.sort(key=lambda c: (role_order.get(c.role, 5), -c.coverage))
+    # Assign families by hue clustering (post-selection presentation grouping)
+    # This groups colors by hue angle for display, separate from the LAB-based selection
+    assign_hue_families(notable_colors)
+
+    # Sort notable colors: by family, then by lightness (light to dark) within family
+    notable_colors.sort(key=lambda c: (c.family_index, -c.lab[0]))
 
     # Find contrast pairs
     contrast_pairs = []
@@ -2681,6 +2742,9 @@ def synthesize(data: PreparedData, features: FeatureData) -> SynthesisResult:
     all_L = [m.lab[0] for m in features.metrics.values()]
     all_chroma = [m.chroma for m in features.metrics.values()]
 
+    # Count unique families represented in notable colors
+    family_count = len(set(c.family_index for c in notable_colors))
+
     return SynthesisResult(
         scheme_type=scheme_type,
         scheme_description=scheme_desc,
@@ -2690,7 +2754,8 @@ def synthesize(data: PreparedData, features: FeatureData) -> SynthesisResult:
         harmonic_pairs=harmonic_pairs,
         distribution_analysis=analyze_distribution(notable_colors),
         lightness_range=(min(all_L), max(all_L)),
-        chroma_range=(min(all_chroma), max(all_chroma))
+        chroma_range=(min(all_chroma), max(all_chroma)),
+        family_count=family_count
     )
 
 
@@ -2715,24 +2780,26 @@ def render(synthesis: SynthesisResult, features: FeatureData) -> str:
     lines.append(f"Distribution: {synthesis.distribution_analysis}")
     lines.append("")
 
-    # Colors section
+    # Colors section - grouped by family, sorted light→dark within each
     lines.append("COLORS:")
-    lines.append("Colors ranked by visual prominence. Roles: Dominant = highest coverage,")
-    lines.append("Secondary = next most prominent, Accent = high contrast or saturation with")
-    lines.append("lower coverage, Dark/Light = value extremes for text and backgrounds.")
+    lines.append(f"{len(synthesis.notable_colors)} colors across {synthesis.family_count} families, sorted light→dark within each.")
     lines.append("")
 
+    # Group colors by family
+    current_family = -1
     for color in synthesis.notable_colors:
-        lines.append(f"[{color.role.capitalize()}] {color.name}")
-        lines.append(f"  Hex: {color.hex} | RGB: {color.rgb} | LAB: ({color.lab[0]:.0f}, {color.lab[1]:.0f}, {color.lab[2]:.0f})")
+        if color.family_index != current_family:
+            if current_family != -1:
+                lines.append("")  # Blank line between families
+            current_family = color.family_index
+            # Count colors in this family
+            family_size = sum(1 for c in synthesis.notable_colors if c.family_index == current_family)
+            lines.append(f"Family {current_family + 1} ({family_size} {'color' if family_size == 1 else 'colors'}):")
+
         coverage_pct = color.coverage * 100
-        if coverage_pct >= 0.1:
-            lines.append(f"  Coverage: {coverage_pct:.1f}% | Chroma: {color.chroma:.0f}")
-        else:
-            lines.append(f"  Coverage: <0.1% | Chroma: {color.chroma:.0f}")
-        if color.characteristics:
-            lines.append(f"  {'. '.join(color.characteristics)}.")
-        lines.append("")
+        coverage_str = f"{coverage_pct:.1f}%" if coverage_pct >= 0.1 else "<0.1%"
+        lines.append(f"  [{color.role.capitalize()}] {color.name} {color.hex} | L={color.lab[0]:.0f} | {coverage_str}")
+    lines.append("")
 
     # Gradients section
     if synthesis.gradients:
@@ -2862,6 +2929,23 @@ def render_html(synthesis: SynthesisResult, features: FeatureData, image_path: s
         .color-card .name { color: #666; }
         .color-card .values { font-family: monospace; color: #555; font-size: 0.8rem; }
         .color-card .chars { font-style: italic; color: #777; margin-top: 0.25rem; }
+        .family-group {
+            border: 1px solid #e0e0e0;
+            border-radius: 12px;
+            padding: 1rem;
+            margin-bottom: 1.5rem;
+            background: #fafafa;
+        }
+        .family-group .color-card { margin-bottom: 0.75rem; }
+        .family-group .color-card:last-child { margin-bottom: 0; }
+        .family-header {
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: #555;
+            margin-bottom: 0.75rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 1px solid #e8e8e8;
+        }
         .gradient-block {
             background: #fff;
             border-radius: 8px;
@@ -2985,26 +3069,40 @@ def render_html(synthesis: SynthesisResult, features: FeatureData, image_path: s
         lines.append(f'  <div class="swatch" style="background:{color.hex}; color:{text_color}; flex:{width_pct:.1f}">{color.hex}</div>')
     lines.append('</div>')
 
-    # Color details
+    # Color details - grouped by family, sorted light→dark within each
     lines.append('<h2>Colors</h2>')
-    lines.append('<p class="section-intro">Colors ranked by visual prominence. '
-                 '<strong>Dominant</strong> = highest coverage, '
-                 '<strong>Secondary</strong> = next most prominent, '
-                 '<strong>Accent</strong> = high contrast or saturation with lower coverage, '
-                 '<strong>Dark/Light</strong> = value extremes for text and backgrounds.</p>')
+    lines.append(f'<p class="section-intro">{len(synthesis.notable_colors)} colors across '
+                 f'{synthesis.family_count} families, sorted light→dark within each. '
+                 '<strong>Roles:</strong> Dominant = highest coverage, '
+                 'Secondary = supporting, Accent = high contrast/saturation, '
+                 'Dark/Light = value extremes.</p>')
+
+    # Group colors by family
+    current_family = -1
     for color in synthesis.notable_colors:
+        if color.family_index != current_family:
+            if current_family != -1:
+                lines.append('</div>')  # Close previous family group
+            current_family = color.family_index
+            family_size = sum(1 for c in synthesis.notable_colors if c.family_index == current_family)
+            lines.append('<div class="family-group">')
+            lines.append(f'  <div class="family-header">Family {current_family + 1} ({family_size} {"color" if family_size == 1 else "colors"})</div>')
+
         text_color = text_color_for_background(color.lab[0])
         coverage_str = f"{color.coverage*100:.1f}%" if color.coverage >= 0.001 else "<0.1%"
-        lines.append('<div class="color-card">')
-        lines.append(f'  <div class="swatch" style="background:{color.hex}; color:{text_color}">{color.hex}</div>')
-        lines.append('  <div class="info">')
-        lines.append(f'    <span class="role">{color.role}</span> <span class="name">{color.name}</span>')
-        lines.append(f'    <div class="values">RGB{color.rgb} · LAB({color.lab[0]:.0f}, {color.lab[1]:.0f}, {color.lab[2]:.0f})</div>')
-        lines.append(f'    <div class="values">Coverage: {coverage_str} · Chroma: {color.chroma:.0f}</div>')
+        lines.append('  <div class="color-card">')
+        lines.append(f'    <div class="swatch" style="background:{color.hex}; color:{text_color}">{color.hex}</div>')
+        lines.append('    <div class="info">')
+        lines.append(f'      <span class="role">{color.role}</span> <span class="name">{color.name}</span>')
+        lines.append(f'      <div class="values">RGB{color.rgb} · LAB({color.lab[0]:.0f}, {color.lab[1]:.0f}, {color.lab[2]:.0f})</div>')
+        lines.append(f'      <div class="values">Coverage: {coverage_str} · Chroma: {color.chroma:.0f}</div>')
         if color.characteristics:
-            lines.append(f'    <div class="chars">{". ".join(color.characteristics)}.</div>')
+            lines.append(f'      <div class="chars">{". ".join(color.characteristics)}.</div>')
+        lines.append('    </div>')
         lines.append('  </div>')
-        lines.append('</div>')
+
+    if current_family != -1:
+        lines.append('</div>')  # Close last family group
 
     # Gradients
     if synthesis.gradients:
