@@ -2218,10 +2218,17 @@ class HarmonicPair:
 
 
 @dataclass
+class HueStructure:
+    """Factual hue data derived from displayed families."""
+    chromatic_count: int  # Number of chromatic (non-neutral) families
+    hue_centers: list[float]  # Hue angles (0-360) for each chromatic family
+    separations: list[float]  # Angular distances between adjacent hues (sorted)
+
+
+@dataclass
 class SynthesisResult:
     """Output of Stage 3: Synthesis."""
-    scheme_type: str
-    scheme_description: str
+    hue_structure: HueStructure
     notable_colors: list[NotableColor]
     gradients: list[GradientChain]
     contrast_pairs: list[ContrastPair]
@@ -2527,53 +2534,50 @@ def analyze_distribution(notable_colors: list) -> str:
         return f"Distributed: {len(notable_colors)} colors share coverage"
 
 
-def determine_scheme_type(families: list, notable_colors: list) -> tuple:
-    """Determine the color scheme type."""
-    chromatic_families = [f for f in families if not f.is_neutral]
-    neutral_family = next((f for f in families if f.is_neutral), None)
+def compute_hue_structure(notable_colors: list[NotableColor]) -> HueStructure:
+    """
+    Compute hue structure from displayed notable colors.
 
-    # Check for accents
-    accents = [c for c in notable_colors if c.role == 'accent']
+    Derives chromatic family count, hue centers, and angular separations
+    directly from the colors shown to the consumer.
+    """
+    # Group colors by family index
+    families_by_idx: dict[int, list[NotableColor]] = {}
+    for color in notable_colors:
+        families_by_idx.setdefault(color.family_index, []).append(color)
 
-    if not chromatic_families:
-        return "achromatic", "Grayscale palette with no chromatic content"
+    # Identify chromatic families (average chroma > threshold)
+    chromatic_hues = []
+    for colors in families_by_idx.values():
+        avg_chroma = sum(c.chroma for c in colors) / len(colors)
+        if avg_chroma >= NEUTRAL_CHROMA_THRESHOLD:
+            # Compute coverage-weighted circular mean hue for this family
+            hue_rads = [np.radians(compute_hue(c.lab)) for c in colors]
+            sin_sum = sum(c.coverage * np.sin(h) for c, h in zip(colors, hue_rads))
+            cos_sum = sum(c.coverage * np.cos(h) for c, h in zip(colors, hue_rads))
+            avg_hue = np.degrees(np.arctan2(sin_sum, cos_sum)) % 360
+            chromatic_hues.append(avg_hue)
 
-    if len(chromatic_families) == 1:
-        if accents and neutral_family and neutral_family.total_coverage > 0.5:
-            return "neutral_accent", f"Neutral base with {chromatic_families[0].hue_center:.0f}° accent"
-        else:
-            return "monochromatic", f"Single hue family around {chromatic_families[0].hue_center:.0f}°"
+    # Sort hues for consistent ordering
+    chromatic_hues.sort()
 
-    # Multiple chromatic families - analyze hue relationships
-    hues = [f.hue_center for f in chromatic_families]
+    # Compute separations between adjacent hues (circular)
+    separations = []
+    if len(chromatic_hues) >= 2:
+        for i in range(len(chromatic_hues)):
+            next_i = (i + 1) % len(chromatic_hues)
+            if next_i == 0:
+                # Wrap-around: last to first
+                sep = (chromatic_hues[0] + 360) - chromatic_hues[-1]
+            else:
+                sep = chromatic_hues[next_i] - chromatic_hues[i]
+            separations.append(sep)
 
-    if len(hues) == 2:
-        hue_diff = circular_hue_distance(hues[0], hues[1])
-
-        if hue_diff < 60:
-            return "analogous", f"Adjacent hues ({hues[0]:.0f}° and {hues[1]:.0f}°)"
-        elif 150 < hue_diff < 210:
-            return "complementary", f"Opposing hues ({hues[0]:.0f}° and {hues[1]:.0f}°)"
-
-    if len(hues) == 3:
-        # Check for triadic (roughly 120° apart)
-        hues_sorted = sorted(hues)
-        diffs = [hues_sorted[1] - hues_sorted[0],
-                 hues_sorted[2] - hues_sorted[1],
-                 (360 + hues_sorted[0]) - hues_sorted[2]]
-
-        if all(80 < d < 160 for d in diffs):
-            return "triadic", "Three hues roughly 120° apart"
-
-    # Check for analogous with accent
-    if len(chromatic_families) >= 2:
-        main_hues = sorted(hues)[:2]
-        main_diff = circular_hue_distance(main_hues[0], main_hues[1])
-
-        if main_diff < 60 and accents:
-            return "analogous_accent", "Analogous base with contrasting accent"
-
-    return "complex", f"Multi-hue palette with {len(chromatic_families)} color families"
+    return HueStructure(
+        chromatic_count=len(chromatic_hues),
+        hue_centers=chromatic_hues,
+        separations=separations
+    )
 
 
 # Threshold for hue-based family clustering (degrees)
@@ -2735,8 +2739,8 @@ def synthesize(data: PreparedData, features: FeatureData) -> SynthesisResult:
 
     harmonic_pairs = harmonic_pairs[:5]  # Limit to top 5
 
-    # Determine scheme type
-    scheme_type, scheme_desc = determine_scheme_type(features.families, notable_colors)
+    # Compute hue structure from displayed notable colors
+    hue_structure = compute_hue_structure(notable_colors)
 
     # Lightness and chroma ranges
     all_L = [m.lab[0] for m in features.metrics.values()]
@@ -2746,8 +2750,7 @@ def synthesize(data: PreparedData, features: FeatureData) -> SynthesisResult:
     family_count = len(set(c.family_index for c in notable_colors))
 
     return SynthesisResult(
-        scheme_type=scheme_type,
-        scheme_description=scheme_desc,
+        hue_structure=hue_structure,
         notable_colors=notable_colors,
         gradients=features.gradients,
         contrast_pairs=contrast_pairs,
@@ -2769,11 +2772,21 @@ def render(synthesis: SynthesisResult, features: FeatureData) -> str:
 
     # Header
     lines.append("OVERVIEW:")
-    lines.append("Palette classification based on hue distribution, contrast range, and color")
+    lines.append("Palette analysis based on hue distribution, contrast range, and color")
     lines.append("relationships. Lightness (L) and chroma (saturation) ranges show tonal spread.")
     lines.append("")
-    lines.append(f"Scheme: {synthesis.scheme_type}")
-    lines.append(f"  {synthesis.scheme_description}")
+
+    # Hue structure
+    hs = synthesis.hue_structure
+    if hs.chromatic_count == 0:
+        lines.append("Hue structure: achromatic (no chromatic families)")
+    elif hs.chromatic_count == 1:
+        lines.append(f"Hue structure: 1 chromatic family at {hs.hue_centers[0]:.0f}°")
+    else:
+        hues_str = ", ".join(f"{h:.0f}°" for h in hs.hue_centers)
+        seps_str = ", ".join(f"{s:.0f}°" for s in hs.separations)
+        lines.append(f"Hue structure: {hs.chromatic_count} chromatic families at {hues_str}")
+        lines.append(f"  Separations: {seps_str}")
     lines.append(f"Lightness range: {synthesis.lightness_range[0]:.0f}-{synthesis.lightness_range[1]:.0f} | "
                  f"Chroma range: {synthesis.chroma_range[0]:.0f}-{synthesis.chroma_range[1]:.0f}")
     lines.append(f"Notable colors: {len(synthesis.notable_colors)}")
@@ -3050,10 +3063,25 @@ def render_html(synthesis: SynthesisResult, features: FeatureData, image_path: s
 
     # Header
     lines.append('<h2>Overview</h2>')
-    lines.append('<p class="section-intro">Palette classification based on hue distribution, contrast range, and color '
+    lines.append('<p class="section-intro">Palette analysis based on hue distribution, contrast range, and color '
                  'relationships. Lightness (L) and chroma (saturation) ranges show tonal spread.</p>')
-    lines.append(f'<h1>{synthesis.scheme_type}</h1>')
-    lines.append(f'<p class="meta">{synthesis.scheme_description}</p>')
+
+    # Hue structure
+    hs = synthesis.hue_structure
+    if hs.chromatic_count == 0:
+        hue_title = "Achromatic"
+        hue_desc = "No chromatic families"
+    elif hs.chromatic_count == 1:
+        hue_title = f"1 Chromatic Family"
+        hue_desc = f"Hue center at {hs.hue_centers[0]:.0f}°"
+    else:
+        hues_str = ", ".join(f"{h:.0f}°" for h in hs.hue_centers)
+        seps_str = ", ".join(f"{s:.0f}°" for s in hs.separations)
+        hue_title = f"{hs.chromatic_count} Chromatic Families"
+        hue_desc = f"Hue centers: {hues_str} | Separations: {seps_str}"
+
+    lines.append(f'<h1>{hue_title}</h1>')
+    lines.append(f'<p class="meta">{hue_desc}</p>')
     lines.append(f'<p class="meta">Source: {safe_path}</p>')
     lines.append(f'<p class="meta">Lightness: {synthesis.lightness_range[0]:.0f}–{synthesis.lightness_range[1]:.0f} | '
                  f'Chroma: {synthesis.chroma_range[0]:.0f}–{synthesis.chroma_range[1]:.0f} | '
