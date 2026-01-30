@@ -1,6 +1,6 @@
 [project]
 name = "image-palette-extractor"
-version = "0.3.0"
+version = "0.4.0"
 description = "Extract color palettes from images for web design. Produces LLM-consumable prose with color roles, WCAG contrast pairs, and harmonic relationships."
 authors = [{ name = "Simon Sorkin" }]
 license = { text = "MIT" }
